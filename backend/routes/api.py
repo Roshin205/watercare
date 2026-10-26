@@ -11,7 +11,7 @@ from pathlib import Path
 from uuid import uuid4
 
 from flask import Blueprint, current_app, g, jsonify, request, send_file, session
-from sqlalchemy import select
+from sqlalchemy import String, cast, func, or_, select
 from werkzeug.security import generate_password_hash
 from werkzeug.utils import secure_filename
 
@@ -43,8 +43,97 @@ RESOURCES = {
 }
 
 
+SEARCH_COLUMNS = {
+    "clients": ("name", "organization_name", "contact_person", "phone", "email", "address", "category", "notes"),
+    "engineers": ("engineer_code", "full_name", "email", "phone", "specialization", "availability"),
+    "projects": ("name", "client_name", "service", "location", "system_details", "engineer_name", "invoice_number", "status", "approval_status"),
+    "project_tasks": ("title", "description", "location", "notes", "status"),
+    "cleaning_records": ("site_name", "tank_identification", "tank_type", "location", "procedure", "materials_used", "observations", "notes", "status"),
+    "water_testing_records": ("sample_identification", "sampling_location", "water_source", "testing_category", "interpretation", "laboratory_details", "notes", "status"),
+}
+RECORD_DATE_COLUMNS = {"project_tasks": "scheduled_date", "cleaning_records": "cleaning_date", "water_testing_records": "collection_date"}
+NO_DATE = "9999-12-31"
+
+
 class ApprovalConflict(Exception):
     pass
+
+
+def project_date():
+    """The date a project is listed under: its start date, or the older single-date fields."""
+    return func.coalesce(projects.c.start_date, projects.c.scheduled_date, projects.c.contract_period)
+
+
+def project_order_key():
+    return func.coalesce(projects.c.priority_date, project_date(), NO_DATE)
+
+
+def in_project_order(query):
+    """Date order, with any manual "do this first" moves applied."""
+    return query.order_by(
+        project_order_key(), func.coalesce(projects.c.priority_rank, 0),
+        func.coalesce(project_date(), NO_DATE), projects.c.created_at,
+    )
+
+
+def checked_date(value, label):
+    if not re.fullmatch(r"\d{4}-\d{2}-\d{2}", value):
+        raise ValueError(f"{label} must use YYYY-MM-DD format.")
+    date.fromisoformat(value)
+    return value
+
+
+def apply_list_filters(table, query, args):
+    """Apply the shared search, client, project and date filters. Raises ValueError for unusable input."""
+    columns = query.table.c
+    search = (args.get("search") or "").strip()
+    if len(search) > 100:
+        raise ValueError("Search text must be 100 characters or fewer.")
+    if search:
+        pattern = "%" + search.replace("\\", "\\\\").replace("%", "\\%").replace("_", "\\_") + "%"
+        conditions = [columns[name].ilike(pattern, escape="\\") for name in SEARCH_COLUMNS[table]]
+        if table == "projects":
+            conditions.append(cast(projects.c.so_no, String).ilike(pattern, escape="\\"))
+        if "client_id" in columns:
+            matching_clients = db().table("clients").select("id").eq("organization_id", g.organization_id).is_(
+                "deleted_at", "null"
+            ).ilike("name", pattern).execute().data or []
+            if matching_clients:
+                conditions.append(columns.client_id.in_([client["id"] for client in matching_clients]))
+        query = query.where(or_(*conditions))
+    for key, label in (("client_id", "Client"), ("project_id", "Project")):
+        value = args.get(key)
+        if not value:
+            continue
+        try:
+            uuid.UUID(value)
+        except ValueError:
+            raise ValueError(f"{label} filter must be a valid record ID.")
+        own_table = (key == "client_id" and table == "clients") or (key == "project_id" and table == "projects")
+        column = columns.id if own_table else columns.get(key)
+        if column is None:
+            raise ValueError(f"{label} filtering is not available for this list.")
+        query = query.where(column == value)
+    start = checked_date(args["from"], "from") if args.get("from") else None
+    end = checked_date(args["to"], "to") if args.get("to") else None
+    if start and end and start > end:
+        raise ValueError("from must not be after to.")
+    if start or end:
+        if table == "projects":
+            # A project matches when any day between its start and end date falls inside the range.
+            first = project_date()
+            if start:
+                query = query.where(func.coalesce(projects.c.end_date, first) >= start)
+            if end:
+                query = query.where(first <= end)
+        elif table in RECORD_DATE_COLUMNS:
+            if start:
+                query = query.gte(RECORD_DATE_COLUMNS[table], start)
+            if end:
+                query = query.lte(RECORD_DATE_COLUMNS[table], end)
+        else:
+            raise ValueError("Date filtering is not available for this list.")
+    return query
 
 
 def db():
@@ -389,30 +478,18 @@ def collection(resource):
     def get_collection():
         try:
             query = scoped_query(table)
-            search = request.args.get("search", "").strip()
-            if search and resource in ("clients", "engineers"):
-                column = "name" if resource == "clients" else "full_name"
-                query = query.ilike(column, f"%{search[:100]}%")
-            for key in ("status", "client_id", "engineer_id", "project_id", "category"):
+            try:
+                query = apply_list_filters(table, query, request.args)
+            except ValueError as error:
+                return failure("invalid_request", str(error), 400)
+            for key in ("status", "engineer_id", "category"):
                 value = request.args.get(key)
                 if value and key in RESOURCE_FIELDS[rule_resource]["fields"]:
                     query = query.eq(key, value)
-            start, end = request.args.get("from"), request.args.get("to")
-            date_field = {
-                "projects": "scheduled_date",
-                "project_tasks": "scheduled_date",
-                "cleaning-records": "cleaning_date",
-                "water-testing": "collection_date",
-            }.get(resource)
-            if (start or end) and not date_field:
-                return failure("invalid_request", "Date filtering is not supported for this resource.", 400)
-            if start:
-                query = query.gte(date_field, start)
-            if end:
-                query = query.lte(date_field, end)
             limit = min(max(request.args.get("limit", 100, type=int), 1), 200)
             offset = max(request.args.get("offset", 0, type=int), 0)
-            response = query.order("created_at", desc=True).range(offset, offset + limit - 1).execute()
+            query = in_project_order(query) if table == "projects" else query.order("created_at", desc=True)
+            response = query.range(offset, offset + limit - 1).execute()
             records = response.data or []
             if resource == "projects" and records:
                 assignments = db().table("project_engineers").select("project_id,engineer_id").eq(
@@ -543,6 +620,9 @@ def item(resource, item_id):
                 _resolve_project_client(payload)
             if resource == "projects":
                 _clear_unused_custom_dates(payload)
+                if "start_date" in payload and payload["start_date"] != current.get("start_date"):
+                    # A rescheduled project goes back to its new date's place instead of keeping an old manual slot.
+                    payload.update(priority_date=None, priority_rank=None)
             updated = None
             if submitting:
                 previous = current.get("approval_status")
@@ -665,6 +745,80 @@ def upload():
                 current_app.logger.exception("Could not clean up an incomplete document upload.")
         current_app.logger.exception("Document upload failed.")
         return failure("upload_failed", "The document could not be stored.", 503)
+
+
+@api.post("/projects/<project_id>/move")
+@require_user(roles=EDITORS)
+def move_project(project_id):
+    """Place a project between the projects shown directly above and below it after a drag."""
+    payload = request.get_json(silent=True)
+    if not isinstance(payload, dict) or set(payload) - {"above_id", "below_id"}:
+        return failure("invalid_request", "Provide above_id and/or below_id.", 400)
+    above_id, below_id = payload.get("above_id"), payload.get("below_id")
+    neighbours = [value for value in (above_id, below_id) if value is not None]
+    if not neighbours:
+        return failure("invalid_request", "Provide the project above or below the new position.", 400)
+    try:
+        for value in [project_id, *neighbours]:
+            uuid.UUID(value)
+    except (TypeError, ValueError, AttributeError):
+        return failure("invalid_request", "Project IDs must be valid record IDs.", 400)
+    if project_id in neighbours or above_id == below_id:
+        return failure("invalid_request", "A project cannot be placed next to itself.", 400)
+    try:
+        found = {row["id"]: row for row in scoped_query("projects").in_("id", [project_id, *neighbours]).execute().data or []}
+        if len(found) != len(neighbours) + 1:
+            return failure("not_found", "Project not found.", 404)
+        anchor = found[below_id] if below_id else found[above_id]
+        slot = anchor.get("priority_date") or _project_day(anchor) or NO_DATE
+        # Renumber the whole date slot so ties and earlier moves can never leave the project out of place.
+        slot_rows = in_project_order(db().table("projects").select("id")).eq(
+            "organization_id", g.organization_id
+        ).is_("deleted_at", "null").where(project_order_key() == slot).execute().data or []
+        ids = [row["id"] for row in slot_rows if row["id"] != project_id]
+        if below_id in ids:
+            position = ids.index(below_id)
+        elif above_id in ids:
+            position = ids.index(above_id) + 1
+        else:
+            position = len(ids)
+        ids.insert(position, project_id)
+        now, session = datetime.now(timezone.utc).isoformat(), sqlalchemy_db.session
+        try:
+            for rank, item_id in enumerate(ids):
+                values = {"priority_date": slot, "priority_rank": float(rank)}
+                if item_id == project_id:
+                    values.update(updated_by=g.user.id, updated_at=now)
+                session.execute(projects.update().where(
+                    projects.c.organization_id == g.organization_id, projects.c.id == item_id,
+                ).values(**values))
+            session.commit()
+        except Exception:
+            session.rollback()
+            raise
+        return jsonify({"data": record("projects", project_id)[0]})
+    except Exception:
+        current_app.logger.exception("Project reorder failed.")
+        return failure("database_error", "The new order could not be saved.", 503)
+
+
+@api.post("/projects/order/reset")
+@require_user(roles=EDITORS)
+def reset_project_order():
+    try:
+        sqlalchemy_db.session.execute(projects.update().where(
+            projects.c.organization_id == g.organization_id,
+        ).values(priority_date=None, priority_rank=None))
+        sqlalchemy_db.session.commit()
+        return jsonify({"message": "Projects are back in date order."})
+    except Exception:
+        sqlalchemy_db.session.rollback()
+        current_app.logger.exception("Project order reset failed.")
+        return failure("database_error", "The order could not be reset.", 503)
+
+
+def _project_day(project):
+    return project.get("start_date") or project.get("scheduled_date") or project.get("contract_period")
 
 
 @api.post("/projects/<project_id>/approve")
@@ -1166,30 +1320,19 @@ def export_report():
     output_format = request.args.get("format", "csv").lower()
     if output_format not in {"csv", "xlsx", "pdf"}:
         return failure("invalid_request", "format must be csv, xlsx, or pdf.", 400)
-    start, end = request.args.get("from"), request.args.get("to")
     try:
-        if start:
-            if not re.fullmatch(r"\d{4}-\d{2}-\d{2}", start):
-                raise ValueError()
-            date.fromisoformat(start)
-        if end:
-            if not re.fullmatch(r"\d{4}-\d{2}-\d{2}", end):
-                raise ValueError()
-            date.fromisoformat(end)
-        if start and end and start > end:
-            return failure("invalid_request", "from must not be after to.", 400)
-    except ValueError:
-        return failure("invalid_request", "Dates must use YYYY-MM-DD format.", 400)
+        query = apply_list_filters(table, scoped_query(table), request.args)
+    except ValueError as error:
+        return failure("invalid_request", str(error), 400)
     try:
-        query = scoped_query(table)
         filter_fields = {
-            "projects": {"status", "client_id", "category", "engineer_id"},
-            "cleaning": {"status", "client_id", "engineer_id"},
-            "water-testing": {"status", "client_id", "engineer_id"},
+            "projects": {"status", "category", "engineer_id"},
+            "cleaning": {"status", "engineer_id"},
+            "water-testing": {"status", "engineer_id"},
             "clients": set(),
             "engineers": set(),
         }[resource]
-        if any(request.args.get(key) for key in {"status", "client_id", "engineer_id", "category"} - filter_fields):
+        if any(request.args.get(key) for key in {"status", "engineer_id", "category"} - filter_fields):
             return failure("invalid_request", "A filter is not supported for this report.", 400)
         for key in filter_fields - {"engineer_id"}:
             if request.args.get(key):
@@ -1203,16 +1346,7 @@ def export_report():
                 query = query.in_("id", project_ids) if project_ids else query.eq("id", "00000000-0000-0000-0000-000000000000")
             else:
                 query = query.eq("engineer_id", request.args["engineer_id"])
-        date_field = {
-            "cleaning": "cleaning_date", "water-testing": "collection_date",
-            "projects": "scheduled_date",
-        }.get(resource)
-        if (start or end) and not date_field:
-            return failure("invalid_request", "Date filtering is not supported for this report.", 400)
-        if date_field and request.args.get("from"):
-            query = query.gte(date_field, request.args["from"])
-        if date_field and request.args.get("to"):
-            query = query.lte(date_field, request.args["to"])
+        query = in_project_order(query) if table == "projects" else query.order("created_at", desc=True)
         rows = query.limit(5000).execute().data or []
         fields = [field for field in rows[0] if field not in {"organization_id", "deleted_at"}] if rows else []
         basename = f"watercare-{resource}-report"

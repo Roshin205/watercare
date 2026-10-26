@@ -356,15 +356,23 @@ def test_impossible_project_dates_are_rejected_and_do_not_break_the_calendar(app
     assert valid["id"] in shown and legacy["id"] not in shown
 
 
-def test_water_testing_form_round_trips_json_fields():
+def run_browser_test(filename):
     node = shutil.which("node")
     if not node:
         pytest.skip("Node.js is required for the browser form tests.")
     result = subprocess.run(
-        [node, "--test", str(Path(__file__).parent / "js" / "json_fields.test.js")],
+        [node, "--test", str(Path(__file__).parent / "js" / filename)],
         capture_output=True, text=True, timeout=60,
     )
     assert result.returncode == 0, result.stdout + result.stderr
+
+
+def test_water_testing_form_round_trips_json_fields():
+    run_browser_test("json_fields.test.js")
+
+
+def test_map_location_search_suggestions_and_typed_coordinates():
+    run_browser_test("place_search.test.js")
 
 
 def test_wrong_http_method_returns_json_405(client):
@@ -760,13 +768,14 @@ def test_migration_adds_new_fields_and_keeps_existing_records(tmp_path):
             connection.execute(text("INSERT INTO engineers (id, organization_id, full_name, is_active, created_at, updated_at) VALUES ('e', 'o', 'Existing Engineer', 1, :now, :now)"), {"now": now})
         upgrade()
         inspector = inspect(db.engine)
-        assert {"latitude", "longitude", "invoice_number", "approval_status", "rejection_reason", "engineer_visit_custom_date"} <= {
-            column["name"] for column in inspector.get_columns("projects")
-        }
+        assert {
+            "latitude", "longitude", "invoice_number", "approval_status", "rejection_reason",
+            "engineer_visit_custom_date", "priority_date", "priority_rank",
+        } <= {column["name"] for column in inspector.get_columns("projects")}
         assert "engineer_code" in {column["name"] for column in inspector.get_columns("engineers")}
         assert "approval_history" in inspector.get_table_names()
         with db.engine.connect() as connection:
-            assert connection.execute(text("SELECT version_num FROM alembic_version")).scalar() == "202610260006"
+            assert connection.execute(text("SELECT version_num FROM alembic_version")).scalar() == "202610270007"
             assert connection.execute(text("SELECT role FROM organization_memberships WHERE id = 'mm'")).scalar() == "service_coordinator"
             rows = dict(connection.execute(text("SELECT id, approval_status FROM projects")).all())
             assert rows == {"p-open": "Pending", "p-done": None}
@@ -813,3 +822,90 @@ def test_records_persist_after_the_application_restarts(tmp_path):
         assert admin.get("/api/engineers").json["data"][0]["engineer_code"] == "ENG-900"
         assert [row["action"] for row in admin.get("/api/approval-history").json["data"]] == ["Rejected", "Submitted"]
         db.engine.dispose()
+
+
+# --- Work order (date order with manual moves) and list filters ---
+
+def project_names(test_client, query=""):
+    response = test_client.get(f"/api/projects?{query}")
+    assert response.status_code == 200, response.json
+    return [row["name"] for row in response.json["data"]]
+
+
+def test_projects_list_in_date_order_and_can_be_moved_anywhere(app, client):
+    headers = csrf(client)
+    early = new_project(client, name="Early", start_date="2026-11-01", end_date="2026-11-01")
+    middle = new_project(client, name="Middle", start_date="2026-11-03", end_date="2026-11-04")
+    late = new_project(client, name="Late", start_date="2026-11-05", end_date="2026-11-05")
+    assert project_names(client) == ["Early", "Middle", "Late"]
+
+    moved = client.post(f"/api/projects/{late['id']}/move", headers=headers, json={"above_id": None, "below_id": early["id"]})
+    assert moved.status_code == 200, moved.json
+    assert moved.json["data"]["start_date"] == "2026-11-05"
+    assert project_names(client) == ["Late", "Early", "Middle"]
+    assert client.post(f"/api/projects/{middle['id']}/move", headers=headers, json={"above_id": late["id"], "below_id": early["id"]}).status_code == 200
+    assert project_names(client) == ["Late", "Middle", "Early"]
+    assert client.post(f"/api/projects/{late['id']}/move", headers=headers, json={"above_id": early["id"]}).status_code == 200
+    assert project_names(client) == ["Middle", "Early", "Late"]
+
+    new_project(client, name="New", start_date="2026-11-02", end_date="2026-11-02")
+    assert project_names(client) == ["Middle", "Early", "Late", "New"]
+    rescheduled = client.patch(f"/api/projects/{late['id']}", headers=headers, json={"start_date": "2026-11-10", "end_date": "2026-11-10"})
+    assert rescheduled.status_code == 200 and rescheduled.json["data"]["priority_date"] is None
+    assert project_names(client) == ["Middle", "Early", "New", "Late"]
+
+    for invalid, status in (
+        ({}, 400), ({"above_id": late["id"], "below_id": late["id"]}, 400), ({"below_id": middle["id"]}, 400),
+        ({"below_id": "not-an-id"}, 400), ({"below_id": str(uuid4())}, 404),
+    ):
+        response = client.post(f"/api/projects/{middle['id']}/move", headers=headers, json=invalid)
+        assert response.status_code == status, (invalid, response.json)
+
+    for role in ("employee", "viewer"):
+        user = add_account(app, client, role, f"Order {role}")
+        assert user.post(f"/api/projects/{late['id']}/move", headers=csrf(user), json={"below_id": early["id"]}).status_code == 403
+        assert user.post("/api/projects/order/reset", headers=csrf(user)).status_code == 403
+
+    assert client.post("/api/projects/order/reset", headers=headers).status_code == 200
+    assert project_names(client) == ["Early", "New", "Middle", "Late"]
+
+
+def test_lists_filter_by_search_client_project_and_date(client):
+    headers = csrf(client)
+    pool = new_project(client, client_name="Alpha Hotels", name="Pool System", so_no=4401,
+                       start_date="2026-11-01", end_date="2026-11-10", engineer_name="Rami Haddad")
+    chiller = new_project(client, client_name="Beta Towers", name="Chiller Plant", so_no=5502,
+                          start_date="2026-12-01", end_date="2026-12-02", location="Lusail Marina")
+    assert project_names(client, "search=chiller") == ["Chiller Plant"]
+    assert project_names(client, "search=alpha") == ["Pool System"]
+    assert project_names(client, "search=4401") == ["Pool System"]
+    assert project_names(client, "search=haddad") == ["Pool System"]
+    assert project_names(client, "search=lusail") == ["Chiller Plant"]
+    assert project_names(client, "search=%25") == []
+    assert project_names(client, f"client_id={chiller['client_id']}") == ["Chiller Plant"]
+    assert project_names(client, f"project_id={pool['id']}") == ["Pool System"]
+    assert project_names(client, "from=2026-11-05&to=2026-11-06") == ["Pool System"]
+    assert project_names(client, "from=2026-11-11&to=2026-11-30") == []
+    assert project_names(client, "from=2026-12-02") == ["Chiller Plant"]
+    for bad in ("from=2026-13-01", "from=2026-11-10&to=2026-11-01", "client_id=nope", f"search={'x' * 101}"):
+        assert client.get(f"/api/projects?{bad}").status_code == 400, bad
+
+    cleaning = client.post("/api/cleaning-records", headers=headers, json={
+        "client_id": pool["client_id"], "cleaning_date": "2026-11-03", "tank_identification": "T-9",
+    }).json["data"]
+    client.post("/api/cleaning-records", headers=headers, json={
+        "client_id": chiller["client_id"], "cleaning_date": "2026-12-03", "tank_identification": "T-1",
+    })
+    cleaning_ids = lambda query: [row["id"] for row in client.get(f"/api/cleaning-records?{query}").json["data"]]
+    assert cleaning_ids("search=alpha") == [cleaning["id"]]
+    assert cleaning_ids("from=2026-11-01&to=2026-11-30") == [cleaning["id"]]
+    assert client.get(f"/api/cleaning-records?project_id={pool['id']}").status_code == 400
+
+    client.post("/api/engineers", headers=headers, json={"full_name": "Search Engineer", "engineer_code": "ENG-77"})
+    assert [row["engineer_code"] for row in client.get("/api/engineers?search=eng-77").json["data"]] == ["ENG-77"]
+    assert [row["name"] for row in client.get("/api/clients?search=towers").json["data"]] == ["Beta Towers"]
+    assert client.get("/api/clients?from=2026-11-01").status_code == 400
+
+    export = client.get("/api/reports/export?resource=projects&format=csv&search=chiller")
+    assert export.status_code == 200
+    assert b"Chiller Plant" in export.data and b"Pool System" not in export.data

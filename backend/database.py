@@ -22,6 +22,7 @@ class Query:
         self.filters = []
         self.ordering = None
         self.order_desc = False
+        self.order_expressions = []
         self.row_limit = None
         self.row_offset = None
         self.operation = "select"
@@ -78,6 +79,15 @@ class Query:
         self.order_desc = desc
         return self
 
+    def where(self, condition):
+        """Add a SQLAlchemy condition the builder methods cannot express (OR groups, COALESCE ranges)."""
+        self.filters.append(condition)
+        return self
+
+    def order_by(self, *expressions):
+        self.order_expressions = list(expressions)
+        return self
+
     def limit(self, value):
         self.row_limit = value
         return self
@@ -111,7 +121,9 @@ class Query:
                 statement = select(*self.columns).select_from(self.table)
                 if self.filters:
                     statement = statement.where(and_(*self.filters))
-                if self.ordering is not None:
+                if self.order_expressions:
+                    statement = statement.order_by(*self.order_expressions)
+                elif self.ordering is not None:
                     statement = statement.order_by(self.ordering.desc() if self.order_desc else self.ordering.asc())
                 if self.row_limit is not None:
                     statement = statement.limit(self.row_limit)

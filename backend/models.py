@@ -128,6 +128,9 @@ projects = business_table(
     Column("invoice_number", String(100)),
     Column("approval_status", String(40), default="Pending", index=True),
     Column("rejection_reason", Text),
+    # Manual "do this first" order: the date slot a project is sorted under, and its position within that slot.
+    Column("priority_date", String(10)),
+    Column("priority_rank", Float),
 )
 project_engineers = Table(
     "project_engineers", db.metadata,

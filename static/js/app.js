@@ -1,6 +1,7 @@
 (() => {
   const $ = (selector) => document.querySelector(selector);
   const jsonFields = window.WaterCareJsonFields;
+  const places = window.WaterCarePlaces;
   const api = "/api";
   // Service Coordinators and Accountants (and the account-owning Administrator) can edit and approve; everyone else views.
   const EDITOR_ROLES = ["administrator", "service_coordinator", "accountant"];
@@ -20,9 +21,25 @@
   };
   const fieldLabels = { engineer_code: "Engineer ID", full_name: "Engineer name", engineer_id: "Engineer", approval_status: "approval" };
   let csrfToken = "";
-  let page = "Dashboard", selectedDate = new Date(), month = new Date();
+  // Which filter bar controls each page uses; "day" narrows the dashboard to one date, "range" is a from/to pair.
+  const PAGE_FILTERS = {
+    Dashboard: ["search", "client", "project", "day"],
+    Projects: ["search", "client", "project", "range"],
+    "Cleaning Records": ["search", "client", "range"],
+    "Water Testing": ["search", "client", "project", "range"],
+    Clients: ["search"],
+    Engineers: ["search"],
+    Approvals: ["search", "client", "project", "range"],
+    Reports: ["search", "client", "project", "range"],
+  };
+  const REPORT_FILTERS = { projects: PAGE_FILTERS.Projects, cleaning: PAGE_FILTERS["Cleaning Records"], "water-testing": PAGE_FILTERS["Water Testing"], clients: ["search", "client"] };
+  let page = "Dashboard", selectedDate = new Date(), month = new Date(), dayMode = false;
   let tasks = [], records = [], clients = [], engineers = [], locations = [], editingId = null, currentRole = "";
-  let projectMap = null, projectMarkers = null, pickerMap = null, rejectingProjectId = null;
+  let overviewProjects = [], projectOptions = [], allLocations = [], approvalItems = [], approvalHistory = [], filterTimer = null;
+  let projectMap = null, projectMarkers = null, pickerMap = null, rejectingProjectId = null, basemapStyle = null;
+  const BASEMAP_STYLE_URL = "https://tiles.openfreemap.org/styles/positron";
+  const BASEMAP_ATTRIBUTION = '<a href="https://openfreemap.org" target="_blank" rel="noopener">OpenFreeMap</a> &copy; <a href="https://www.openmaptiles.org/" target="_blank" rel="noopener">OpenMapTiles</a> Data from <a href="https://www.openstreetmap.org/copyright" target="_blank" rel="noopener">OpenStreetMap</a>';
+  const STATUS_LABELS = { pending: "Pending", "submitted-for-approval": "Awaiting approval", approved: "Approved", rejected: "Rejected", completed: "Completed" };
 
   const canEdit = () => EDITOR_ROLES.includes(currentRole);
   const canSubmit = () => canEdit() || currentRole === "employee";
@@ -55,7 +72,7 @@
         button.classList.toggle("hidden", !canEdit());
       });
       $("#user-email").textContent = `${current.user.email || "Employee"} | ${ROLE_LABELS[current.role] || current.role}`;
-      await Promise.all([loadClients(), loadEngineers()]); navigate("Dashboard");
+      await Promise.all([loadClients(), loadEngineers(), loadProjectOptions()]); navigate("Dashboard");
     } catch (error) {
       csrfToken = "";
       $("#app").classList.add("hidden"); $("#login").classList.remove("hidden");
@@ -70,6 +87,15 @@
       $("#client-filter").innerHTML = '<option value="">All clients</option>' + clients.map(client => `<option value="${escapeHtml(client.id)}">${escapeHtml(client.name)}</option>`).join("");
       $("#client-filter").value = clients.some(client => client.id === selected) ? selected : "";
     } catch (error) { showError(error.message); }
+  }
+  async function loadProjectOptions() {
+    try {
+      projectOptions = (await request("/projects?limit=200")).data || [];
+      const selected = $("#project-filter").value;
+      $("#project-filter").innerHTML = '<option value="">All projects</option>' + projectOptions.map(project => `<option value="${escapeHtml(project.id)}">${escapeHtml([project.client_name, project.name].filter(Boolean).join(" · "))}</option>`).join("");
+      $("#project-filter").value = projectOptions.some(project => project.id === selected) ? selected : "";
+    } catch (error) { showError(error.message); }
+    updateResetButtons();
   }
   async function loadEngineers() {
     try { engineers = ((await request("/engineers?limit=200")).data || []).filter(engineer => engineer.is_active !== false); }
@@ -91,6 +117,35 @@
     if (!frequency) return "";
     return frequency === "Custom" && project[group.date] ? `Custom · ${project[group.date]}` : frequency;
   }
+  function projectDay(project) { return project.start_date || project.scheduled_date || project.contract_period || ""; }
+  function dayHeading(value) {
+    if (!value) return "No date set";
+    const [year, monthNumber, day] = value.split("-").map(Number);
+    return new Date(year, monthNumber - 1, day).toLocaleDateString(undefined, { weekday: "long", day: "numeric", month: "long", year: "numeric" });
+  }
+  // Mirrors the server's project order: manual slot date, position in that slot, then the project's own date.
+  function compareProjectOrder(first, second) {
+    const key = project => [project.priority_date || projectDay(project) || "9999-12-31", Number(project.priority_rank ?? 0), projectDay(project) || "9999-12-31", project.created_at || ""];
+    const [a, b] = [key(first), key(second)];
+    for (let index = 0; index < a.length; index++) if (a[index] !== b[index]) return a[index] < b[index] ? -1 : 1;
+    return 0;
+  }
+  function filterValues() {
+    return { search: $("#search-filter").value.trim(), client: $("#client-filter").value, project: $("#project-filter").value, from: $("#from-filter").value, to: $("#to-filter").value };
+  }
+  function filterParams(kinds) {
+    const values = filterValues(), params = new URLSearchParams();
+    if (kinds.includes("search") && values.search) params.set("search", values.search);
+    if (kinds.includes("client") && values.client) params.set("client_id", values.client);
+    if (kinds.includes("project") && values.project) params.set("project_id", values.project);
+    if (kinds.includes("range") && values.from) params.set("from", values.from);
+    if (kinds.includes("range") && values.to) params.set("to", values.to);
+    return params;
+  }
+  function textMatches(parts, search) {
+    return !search || parts.filter(part => part != null).join(" ").toLowerCase().includes(search.toLowerCase());
+  }
+  function inDateRange(value, from, to) { return (!from || (value && value >= from)) && (!to || (value && value <= to)); }
   function cellValue(record, field) {
     if (field === "engineer_visit") return scheduleText(record, FREQUENCY_GROUPS[0]);
     if (field === "approval_status") return record.approval_status || (record.status === "Completed" ? "Completed" : "");
@@ -101,8 +156,30 @@
     const first = new Date(month.getFullYear(), month.getMonth(), 1), last = new Date(month.getFullYear(), month.getMonth() + 1, 0);
     const params = new URLSearchParams({ from: isoDate(first), to: isoDate(last) });
     if ($("#client-filter").value) params.set("client_id", $("#client-filter").value);
-    try { tasks = (await request(`/dashboard/tasks?${params}`)).data || []; renderCalendar(); renderTask(); }
-    catch (error) { showError(error.message); tasks = []; renderCalendar(); renderTask(); }
+    try { tasks = (await request(`/dashboard/tasks?${params}`)).data || []; }
+    catch (error) { showError(error.message); tasks = []; }
+    renderCalendar(); renderOverview();
+  }
+  async function loadOverview() {
+    if (dayMode) { renderOverview(); return; }
+    try {
+      const params = filterParams(["search", "client", "project"]);
+      params.set("limit", "200");
+      overviewProjects = (await request(`/projects?${params}`)).data || [];
+    } catch (error) { showError(error.message); overviewProjects = []; }
+    renderOverview();
+  }
+  function refreshDashboard() { loadTasks(); loadOverview(); loadLocations(); }
+  function selectDay(value) {
+    const [year, monthNumber, day] = value.split("-").map(Number);
+    selectedDate = new Date(year, monthNumber - 1, day); dayMode = true;
+    if (year !== month.getFullYear() || monthNumber - 1 !== month.getMonth()) { month = new Date(year, monthNumber - 1, 1); loadTasks(); }
+    else { renderCalendar(); renderOverview(); }
+    applyMapFilters();
+  }
+  function showAllDates() {
+    dayMode = false; $("#date-filter").value = "";
+    renderCalendar(); loadOverview(); applyMapFilters();
   }
   function renderCalendar() {
     const calendar = $("#calendar"), y = month.getFullYear(), m = month.getMonth();
@@ -114,24 +191,53 @@
     for (let day = 1; day <= count; day++) {
       const value = isoDate(new Date(y, m, day));
       const button = document.createElement("button");
-      button.className = `day${value === isoDate(new Date()) ? " today" : ""}${value === isoDate(selectedDate) ? " selected" : ""}${withTasks.has(value) ? " has-tasks" : ""}`;
+      button.className = `day${value === isoDate(new Date()) ? " today" : ""}${dayMode && value === isoDate(selectedDate) ? " selected" : ""}${withTasks.has(value) ? " has-tasks" : ""}`;
       button.textContent = day; button.setAttribute("aria-label", `${value}${withTasks.has(value) ? ", scheduled tasks" : ""}`);
-      button.onclick = () => { selectedDate = new Date(y, m, day); renderCalendar(); renderTask(); };
+      button.onclick = () => selectDay(value);
       calendar.append(button);
     }
   }
-  function renderTask() {
-    const date = isoDate(selectedDate), matching = tasks.filter(task => task.scheduled_date === date);
-    $("#date-filter").value = date;
-    $("#task-position").textContent = `${matching.length} item${matching.length === 1 ? "" : "s"}`;
-    $("#task-count").textContent = matching.length ? `Work recorded for ${date}` : `No tasks scheduled on ${date}`;
-    $("#task-list").innerHTML = matching.length ? matching.map(taskItem).join("") : '<p class="empty">No scheduled work for this date.</p>';
+  function projectAsTask(project) {
+    return {
+      id: project.id, title: project.name, status: project.status, scheduled_date: projectDay(project),
+      scheduled_time: project.visit_time || project.scheduled_time, location: project.location,
+      description: project.system_details || project.description, record_type: "project", project, engineer_name: project.engineer_name,
+    };
   }
-  function taskItem(task) {
+  function renderOverview() {
+    const { search, project } = filterValues(), reorder = canEdit();
+    let html, count;
+    if (dayMode) {
+      const date = isoDate(selectedDate);
+      $("#date-filter").value = date;
+      const matching = tasks.filter(task => task.scheduled_date === date)
+        .filter(task => !project || task.project?.id === project)
+        .filter(task => textMatches([task.title, task.location, task.description, task.engineer_name, task.status, task.project?.client_name, task.project?.name, task.project?.so_no, task.project?.service, task.project?.approval_status], search));
+      // Projects follow the saved priority order; cleaning and water-test visits keep their time order after them.
+      const ordered = [...matching.filter(task => task.record_type === "project").sort((a, b) => compareProjectOrder(a.project, b.project)), ...matching.filter(task => task.record_type !== "project")];
+      count = ordered.length;
+      $("#task-count").textContent = count ? `Work for ${dayHeading(date)}. Choose "All dates" to see every project.` : `No work matches ${dayHeading(date)}.`;
+      html = count ? `<h3 class="date-heading">${escapeHtml(dayHeading(date))}</h3>${ordered.map(task => taskItem(task, reorder)).join("")}` : '<p class="empty">No scheduled work for this date.</p>';
+    } else {
+      let previousDay = null;
+      count = overviewProjects.length;
+      $("#task-count").textContent = count ? `All projects in work order${reorder ? ". Drag the handle to move a project up or down" : ""}.` : "No projects match these filters.";
+      html = count ? overviewProjects.map(item => {
+        const day = projectDay(item), heading = day !== previousDay ? `<h3 class="date-heading">${escapeHtml(dayHeading(day))}</h3>` : "";
+        previousDay = day;
+        return heading + taskItem(projectAsTask(item), reorder);
+      }).join("") : '<p class="empty">No projects match these filters.</p>';
+    }
+    $("#task-position").textContent = `${count} item${count === 1 ? "" : "s"}`;
+    $("#task-list").innerHTML = html;
+  }
+  function dragHandle() { return '<button type="button" class="drag-handle" title="Drag to reorder" aria-label="Drag to change the work order. Arrow keys also move it."></button>'; }
+  function taskItem(task, reorder = false) {
     const project = task.project || {}, approval = task.record_type === "project" ? project.approval_status : "";
     const service = project.service || { cleaning: "Tank cleaning", water_testing: "Water testing" }[task.record_type] || task.title;
     const details = [
       ["Service", service],
+      ["Dates", project.start_date ? `${project.start_date}${project.end_date && project.end_date !== project.start_date ? ` to ${project.end_date}` : ""}` : ""],
       ["Engineer", task.engineer_name || project.engineer_name || "Engineer not assigned"],
       ["Location", task.location || project.location || "Location not set"],
       ["Time", task.scheduled_time || "Time not set"],
@@ -144,7 +250,8 @@
       ["Rejection reason", approval === "Rejected" ? project.rejection_reason : ""],
       ["Details", task.description || task.notes || project.system_details],
     ].filter(([, value]) => value !== undefined && value !== null && value !== "");
-    return `<details class="task-item"><summary><span class="task-names"><strong>${escapeHtml(project.client_name || "Client not set")}</strong><strong>${escapeHtml(project.name || task.title)}</strong></span><span class="task-meta"><span class="status-badge">${escapeHtml(task.status || "Scheduled")}</span>${approval ? `<span class="status-badge approval-${slug(approval)}">${escapeHtml(approval)}</span>` : ""}${task.scheduled_time ? `<span class="task-time">${escapeHtml(task.scheduled_time)}</span>` : ""}</span></summary><dl class="task-details">${details.map(([label, value]) => `<div><dt>${escapeHtml(label)}</dt><dd>${escapeHtml(value)}</dd></div>`).join("")}</dl>${projectActions(project, true)}</details>`;
+    const movable = reorder && task.record_type === "project" && project.id;
+    return `<details class="task-item"${movable ? ` data-project-id="${escapeHtml(project.id)}"` : ""}><summary>${movable ? dragHandle() : ""}<span class="task-names"><strong>${escapeHtml(project.client_name || "Client not set")}</strong><strong>${escapeHtml(project.name || task.title)}</strong></span><span class="task-meta"><span class="status-badge">${escapeHtml(task.status || "Scheduled")}</span>${approval ? `<span class="status-badge approval-${slug(approval)}">${escapeHtml(approval)}</span>` : ""}${task.scheduled_time ? `<span class="task-time">${escapeHtml(task.scheduled_time)}</span>` : ""}</span></summary><dl class="task-details">${details.map(([label, value]) => `<div><dt>${escapeHtml(label)}</dt><dd>${escapeHtml(value)}</dd></div>`).join("")}</dl>${projectActions(project, true)}</details>`;
   }
   function completionButton(project, outline) {
     const id = escapeHtml(project.id), approval = project.approval_status, className = outline ? ' class="outline"' : "";
@@ -164,39 +271,136 @@
     return `<div class="header-actions task-actions">${edit}${completionButton(project, outline)}${decisionButtons(project, outline)}</div>`;
   }
 
+  function resetFilters() {
+    ["#search-filter", "#client-filter", "#project-filter", "#from-filter", "#to-filter", "#date-filter"].forEach(id => { $(id).value = ""; });
+    dayMode = false;
+  }
   function navigate(nextPage) {
+    if (nextPage !== page) resetFilters();
     page = nextPage; hideError();
     $("#page-title").textContent = page;
     $("#navigation").querySelectorAll("button").forEach(button => button.classList.toggle("active", button.dataset.page === page));
     $("#dashboard").classList.toggle("hidden", page !== "Dashboard");
     $("#approvals").classList.toggle("hidden", page !== "Approvals");
     $("#records").classList.toggle("hidden", !resources[page] && page !== "Reports" && page !== "Settings");
-    $("#client-filter").classList.toggle("hidden", page !== "Dashboard");
-    $("#date-filter").classList.toggle("hidden", page !== "Dashboard");
-    $("#today").classList.toggle("hidden", page !== "Dashboard");
+    const kinds = PAGE_FILTERS[page] || [];
+    $("#filter-bar").classList.toggle("hidden", !kinds.length);
+    $("#filter-bar").querySelectorAll("[data-filter]").forEach(control => control.classList.toggle("hidden", !kinds.includes(control.dataset.filter)));
     $("#add-record").classList.toggle("hidden", !resources[page] || !canEdit());
-    if (page === "Dashboard") { loadTasks(); loadLocations(); }
+    updateResetButtons();
+    if (page === "Dashboard") refreshDashboard();
     else if (resources[page]) loadRecords();
     else if (page === "Approvals") renderApprovals();
     else if (page === "Reports") renderReports();
     else if (page === "Settings") renderSettings();
   }
+  function applyFilters() {
+    if (page === "Dashboard") refreshDashboard();
+    else if (resources[page]) loadRecords();
+    else if (page === "Approvals") renderApprovalTables();
+  }
+  function updateResetButtons() {
+    const manualOrder = canEdit() && projectOptions.some(project => project.priority_date);
+    $("#reset-order").classList.toggle("hidden", !manualOrder || page !== "Projects");
+    $("#reset-order-dashboard").classList.toggle("hidden", !manualOrder);
+  }
   async function loadRecords() {
-    const definition = resources[page];
+    const definition = resources[page], reorder = page === "Projects" && canEdit();
+    const columnCount = definition.columns.length + 1 + (reorder ? 1 : 0);
     $("#records-title").textContent = page;
-    $("#table-head").innerHTML = `<tr>${definition.columns.map(field => `<th>${escapeHtml(fieldLabels[field] || field.replaceAll("_", " "))}</th>`).join("")}<th>Actions</th></tr>`;
+    $("#table-head").innerHTML = `<tr>${reorder ? '<th class="handle-col" aria-label="Work order"></th>' : ""}${definition.columns.map(field => `<th>${escapeHtml(fieldLabels[field] || field.replaceAll("_", " "))}</th>`).join("")}<th>Actions</th></tr>`;
     try {
-      const query = new URLSearchParams({ limit: "200" });
-      if ($("#search").value && ["Clients", "Engineers"].includes(page)) query.set("search", $("#search").value);
+      const query = filterParams(PAGE_FILTERS[page]);
+      query.set("limit", "200");
       const response = await request(`/${definition.path}?${query}`);
       records = response.data || [];
-      if (page === "Projects") {
-        records.forEach(record => {
-          record.client_name ||= clients.find(client => client.id === record.client_id)?.name || "";
-        });
-      }
-      $("#table-body").innerHTML = records.map(record => `<tr>${definition.columns.map(field => `<td>${escapeHtml(cellValue(record, field))}</td>`).join("")}<td>${rowActions(record)}</td></tr>`).join("") || `<tr><td colspan="${definition.columns.length + 1}">No records yet.</td></tr>`;
+      $("#records-count").textContent = `${records.length}${records.length === 200 ? "+" : ""} record${records.length === 1 ? "" : "s"}`;
+      let previousDay = null;
+      $("#table-body").innerHTML = records.map(record => {
+        if (page !== "Projects") return `<tr>${definition.columns.map(field => `<td>${escapeHtml(cellValue(record, field))}</td>`).join("")}<td>${rowActions(record)}</td></tr>`;
+        record.client_name ||= clients.find(client => client.id === record.client_id)?.name || "";
+        const day = projectDay(record), heading = day !== previousDay ? `<tr class="date-group"><th colspan="${columnCount}">${escapeHtml(dayHeading(day))}</th></tr>` : "";
+        previousDay = day;
+        return `${heading}<tr${reorder ? ` data-project-id="${escapeHtml(record.id)}"` : ""}>${reorder ? `<td class="handle-col">${dragHandle()}</td>` : ""}${definition.columns.map(field => `<td>${escapeHtml(cellValue(record, field))}</td>`).join("")}<td>${rowActions(record)}</td></tr>`;
+      }).join("") || `<tr><td colspan="${columnCount}">${filterParams(PAGE_FILTERS[page]).toString() ? "No records match these filters." : "No records yet."}</td></tr>`;
     } catch (error) { showError(error.message); }
+  }
+  function autoScroll(scroller, y) {
+    const edge = 48, step = 14;
+    if (scroller) {
+      const box = scroller.getBoundingClientRect();
+      if (y < box.top + edge) scroller.scrollTop -= step;
+      else if (y > box.bottom - edge) scroller.scrollTop += step;
+    }
+    if (y < edge) window.scrollBy(0, -step);
+    else if (y > innerHeight - edge) window.scrollBy(0, step);
+  }
+  async function refreshAfterReorder() {
+    await loadProjectOptions();
+    if (page === "Projects") await loadRecords();
+    else await Promise.all([loadTasks(), loadOverview()]);
+  }
+  function enableReorder(container) {
+    // Pointer events cover mouse, pen and touch; the handle owns the gesture so the page doesn't scroll instead.
+    const items = () => [...container.querySelectorAll("[data-project-id]")];
+    const save = async item => {
+      const list = items(), index = list.indexOf(item);
+      const body = { above_id: list[index - 1]?.dataset.projectId ?? null, below_id: list[index + 1]?.dataset.projectId ?? null };
+      try { await request(`/projects/${encodeURIComponent(item.dataset.projectId)}/move`, { method: "POST", body: JSON.stringify(body) }); }
+      catch (error) { showError(error.message); }
+      await refreshAfterReorder();
+    };
+    container.addEventListener("click", event => { if (event.target.closest(".drag-handle")) event.preventDefault(); });
+    container.addEventListener("pointerdown", event => {
+      const handle = event.target.closest(".drag-handle"), item = handle?.closest("[data-project-id]");
+      if (!item || event.button > 0) return;
+      event.preventDefault();
+      handle.setPointerCapture(event.pointerId);
+      const pointerId = event.pointerId;
+      const startOrder = items().map(element => element.dataset.projectId).join();
+      const scroller = container.closest(".task-list") || null;
+      let lastX = event.clientX, lastY = event.clientY, finished = false;
+      const reposition = () => {
+        const target = document.elementFromPoint(lastX, lastY)?.closest("[data-project-id]");
+        if (!target || target === item || !container.contains(target)) return;
+        const box = target.getBoundingClientRect();
+        target[lastY < box.top + box.height / 2 ? "before" : "after"](item);
+      };
+      const timer = setInterval(() => { autoScroll(scroller, lastY); reposition(); }, 30);
+      const move = moveEvent => {
+        if (moveEvent.pointerId !== pointerId) return;
+        lastX = moveEvent.clientX; lastY = moveEvent.clientY; reposition();
+      };
+      const finish = finishEvent => {
+        if (finishEvent.pointerId !== pointerId) return;
+        if (finished) return;
+        finished = true; clearInterval(timer);
+        window.removeEventListener("pointermove", move);
+        window.removeEventListener("pointerup", finish);
+        window.removeEventListener("pointercancel", finish);
+        item.classList.remove("dragging");
+        if (items().map(element => element.dataset.projectId).join() !== startOrder) save(item);
+      };
+      item.classList.add("dragging");
+      window.addEventListener("pointermove", move);
+      window.addEventListener("pointerup", finish);
+      window.addEventListener("pointercancel", finish);
+    });
+    container.addEventListener("keydown", event => {
+      const item = event.target.closest(".drag-handle")?.closest("[data-project-id]");
+      if (!item || !["ArrowUp", "ArrowDown"].includes(event.key)) return;
+      event.preventDefault();
+      const list = items(), target = list[list.indexOf(item) + (event.key === "ArrowUp" ? -1 : 1)];
+      if (!target) return;
+      target[event.key === "ArrowUp" ? "before" : "after"](item);
+      const id = item.dataset.projectId;
+      save(item).then(() => container.querySelector(`[data-project-id="${CSS.escape(id)}"] .drag-handle`)?.focus());
+    });
+  }
+  async function resetOrder() {
+    if (!confirm("Put every project back in date order? Manual moves will be cleared.")) return;
+    try { await request("/projects/order/reset", { method: "POST" }); await refreshAfterReorder(); }
+    catch (error) { showError(error.message); }
   }
   function rowActions(record) {
     const id = escapeHtml(record.id);
@@ -217,7 +421,7 @@
     return `<select name="engineer_choice" required><option value="">Choose engineer</option>${engineers.map(engineer => `<option value="${escapeHtml(engineer.id)}" ${assigned?.id === engineer.id ? "selected" : ""}>${escapeHtml(engineerLabel(engineer))}</option>`).join("")}<option value="__other__" ${other ? "selected" : ""}>Other (type a name)</option></select><input name="engineer_other" type="text" placeholder="Engineer name" value="${escapeHtml(other)}">`;
   }
   function locationPicker() {
-    return `<div class="wide location-picker"><span>Map Location</span><div class="map-search"><input name="location_search" type="search" placeholder="Search for a place or address" aria-label="Search map location"><button type="button" id="map-search-button" class="outline">Search</button></div><ul id="map-search-results" class="map-results"></ul><div id="location-picker-map" class="picker-map" role="application" aria-label="Click the map to set the project location"></div><div class="picker-footer"><span id="picker-coordinates"></span><button type="button" id="clear-location" class="text-button">Clear location</button></div><input type="hidden" name="latitude"><input type="hidden" name="longitude"></div>`;
+    return `<div class="wide location-picker"><span>Map Location</span><p class="picker-help">Search on the map and apply a suggestion, or click the map to drop a pin and drag it to the exact spot. You can also type or paste coordinates.</p><div class="picker-shell"><div id="location-picker-map" class="picker-map" role="application" aria-label="Click the map to place the project pin"></div><div class="map-search floating"><input name="location_search" type="search" placeholder="Search a place, address or coordinates" autocomplete="off" aria-label="Search map location" aria-controls="map-search-results"><button type="button" id="map-search-button" class="outline">Search</button><ul id="map-search-results" class="map-results" aria-live="polite"></ul></div></div><div class="coordinate-inputs"><label>Latitude<input name="latitude" type="number" step="any" min="-90" max="90" placeholder="e.g. 25.285400"></label><label>Longitude<input name="longitude" type="number" step="any" min="-180" max="180" placeholder="e.g. 51.531000"></label><button type="button" id="clear-location" class="text-button">Clear location</button></div><p id="picker-status" class="picker-status"></p></div>`;
   }
   async function openForm(id, defaults = {}) {
     editingId = id || null;
@@ -299,60 +503,172 @@
     const syncEngineer = () => { const typed = choice.value === "__other__"; other.classList.toggle("hidden", !typed); other.required = typed; };
     choice.addEventListener("change", syncEngineer); syncEngineer();
   }
-  function mapTiles(map) {
+  function brandBasemapStyle(style) {
+    // English names first (then Latin transliteration), and WaterCare's cream, teal and sage instead of the default greys.
+    const englishName = ["coalesce", ["get", "name:en"], ["get", "name_en"], ["get", "name:latin"], ["get", "name"]];
+    style.layers.forEach(layer => {
+      const id = layer.id;
+      if (layer.type === "symbol" && JSON.stringify(layer.layout?.["text-field"] ?? "").includes("name")) layer.layout["text-field"] = englishName;
+      if (layer.type === "background") layer.paint = { ...layer.paint, "background-color": "#f6f4ee" };
+      if (layer.type === "fill" && id === "water") layer.paint = { ...layer.paint, "fill-color": "#d3e6e8" };
+      if (layer.type === "fill" && /^(park|landcover_wood|landcover_grass)/.test(id)) layer.paint = { ...layer.paint, "fill-color": "#e4eedc" };
+    });
+    return style;
+  }
+  function loadBasemapStyle() {
+    basemapStyle ||= fetch(BASEMAP_STYLE_URL).then(response => {
+      if (!response.ok) throw new Error("Basemap style unavailable.");
+      return response.json();
+    }).then(brandBasemapStyle);
+    return basemapStyle;
+  }
+  function addFallbackTiles(map) {
     L.tileLayer("https://tile.openstreetmap.org/{z}/{x}/{y}.png", {
-      maxZoom: 19, attribution: '&copy; <a href="https://www.openstreetmap.org/copyright">OpenStreetMap</a> contributors',
+      maxZoom: 19, className: "muted-tiles",
+      attribution: '&copy; <a href="https://www.openstreetmap.org/copyright">OpenStreetMap</a> contributors',
     }).addTo(map);
   }
-  function pinIcon() { return L.divIcon({ className: "map-pin-icon", html: '<span class="map-pin"></span>', iconSize: [22, 22], iconAnchor: [11, 27], popupAnchor: [0, -26] }); }
+  async function addBasemap(map) {
+    try {
+      if (!window.maplibregl || !L.maplibreGL) throw new Error("Vector maps are unavailable.");
+      const style = structuredClone(await loadBasemapStyle());
+      if (!document.body.contains(map.getContainer())) return;
+      L.maplibreGL({ style, attributionControl: { customAttribution: BASEMAP_ATTRIBUTION } }).addTo(map);
+    } catch {
+      // No WebGL, a blocked CDN or an OpenFreeMap outage: keep the map usable with toned-down OpenStreetMap tiles.
+      if (document.body.contains(map.getContainer())) addFallbackTiles(map);
+    }
+  }
+  function watchSize(map) {
+    // Leaflet only measures its box on window resizes; dialogs, wrapping text and phone layouts change it without one.
+    if (!window.ResizeObserver) return;
+    const observer = new ResizeObserver(() => map.invalidateSize());
+    observer.observe(map.getContainer());
+    map.on("unload", () => observer.disconnect());
+  }
+  function statusKey(item) { return slug(item.approval_status || (item.status === "Completed" ? "Completed" : "Pending")); }
+  function pinIcon(status = "project") {
+    return L.divIcon({ className: "map-pin-icon", html: `<span class="map-pin status-${status}"></span>`, iconSize: [24, 24], iconAnchor: [12, 29], popupAnchor: [0, -28] });
+  }
+  function clusterIcon(cluster) {
+    return L.divIcon({ className: "map-cluster", html: `<span>${cluster.getChildCount()}</span>`, iconSize: [42, 42] });
+  }
+  function fitButton(onFit) {
+    const Fit = L.Control.extend({
+      onAdd() {
+        const button = L.DomUtil.create("button", "map-fit-button leaflet-bar");
+        button.type = "button"; button.title = "Show all projects"; button.setAttribute("aria-label", "Show all projects");
+        button.innerHTML = '<span aria-hidden="true">⤢</span>';
+        L.DomEvent.disableClickPropagation(button);
+        L.DomEvent.on(button, "click", onFit);
+        return button;
+      },
+    });
+    return new Fit({ position: "topleft" });
+  }
+  async function findPlaces(query, signal, explicit) {
+    const center = pickerMap && pickerMap.getZoom() >= 5 ? pickerMap.getCenter() : null;
+    const params = new URLSearchParams({ q: query, limit: "6", lang: "en" });
+    if (center) { params.set("lat", center.lat.toFixed(4)); params.set("lon", center.lng.toFixed(4)); }
+    let found = [];
+    try {
+      const response = await fetch(`https://photon.komoot.io/api/?${params}`, { signal });
+      if (!response.ok) throw new Error("Place suggestions are unavailable.");
+      found = places.fromPhoton(await response.json());
+    } catch (error) {
+      if (error.name === "AbortError" || !explicit) throw error;
+    }
+    if (found.length || !explicit) return found;
+    // Nominatim allows a search per button press but not search-as-you-type, so it only backs up the Search button.
+    const response = await fetch(`https://nominatim.openstreetmap.org/search?${new URLSearchParams({ format: "jsonv2", limit: "6", q: query, "accept-language": "en" })}`, { signal });
+    if (!response.ok) throw new Error("Location search is unavailable.");
+    return places.fromNominatim(await response.json());
+  }
   function initLocationPicker(existing) {
-    const coordinates = $("#picker-coordinates"), latitude = $('#form-fields [name="latitude"]'), longitude = $('#form-fields [name="longitude"]');
+    const field = name => $(`#form-fields [name="${name}"]`);
+    const status = $("#picker-status"), latitude = field("latitude"), longitude = field("longitude"), search = field("location_search");
+    const results = $("#map-search-results"), locationInput = field("location");
     if (pickerMap) { pickerMap.remove(); pickerMap = null; }
-    if (!window.L) { coordinates.textContent = "The map could not load. Check the internet connection; the rest of the project still saves."; return; }
-    pickerMap = L.map("location-picker-map", { scrollWheelZoom: false });
-    mapTiles(pickerMap);
-    let marker = null;
+    if (existing.latitude != null && existing.longitude != null) { latitude.value = Number(existing.latitude).toFixed(6); longitude.value = Number(existing.longitude).toFixed(6); }
+    if (!window.L) { status.textContent = "The map could not load. You can still type the coordinates, and the rest of the project saves."; return; }
+    pickerMap = L.map("location-picker-map", { scrollWheelZoom: true, zoomControl: false, minZoom: 2, maxZoom: 19 });
+    L.control.zoom({ position: "bottomright" }).addTo(pickerMap);
+    watchSize(pickerMap);
+    const candidates = L.layerGroup().addTo(pickerMap);
+    let marker = null, suggestions = [], autoFilled = "", typingTimer = null, pending = null;
+    const describe = () => {
+      status.textContent = marker ? `Pin set at ${latitude.value}, ${longitude.value}. Drag the pin to fine-tune it.` : "No location saved yet. Search, click the map, or type the coordinates.";
+    };
     const place = (lat, lng, zoom) => {
       latitude.value = lat.toFixed(6); longitude.value = lng.toFixed(6);
-      if (marker) marker.setLatLng([lat, lng]); else marker = L.marker([lat, lng], { icon: pinIcon(), keyboard: false }).addTo(pickerMap);
-      coordinates.textContent = `Selected: ${latitude.value}, ${longitude.value}`;
+      if (marker) marker.setLatLng([lat, lng]);
+      else {
+        marker = L.marker([lat, lng], { icon: pinIcon(), draggable: true, autoPan: true, title: "Project location (drag to adjust)" }).addTo(pickerMap);
+        marker.on("dragend", () => { const point = marker.getLatLng(); place(point.lat, point.lng); });
+      }
       if (zoom) pickerMap.setView([lat, lng], zoom);
+      describe();
     };
+    const clearSuggestions = () => { suggestions = []; candidates.clearLayers(); results.innerHTML = ""; };
     const clear = () => {
       latitude.value = ""; longitude.value = "";
       if (marker) { marker.remove(); marker = null; }
-      coordinates.textContent = "No location saved. Click the map or search to place the site marker.";
+      describe();
     };
-    if (existing.latitude != null && existing.longitude != null) place(Number(existing.latitude), Number(existing.longitude), 15);
+    const apply = index => {
+      const chosen = suggestions[index];
+      if (!chosen) return;
+      place(chosen.lat, chosen.lng, 16);
+      const name = places.fullName(chosen).slice(0, 500);
+      if (chosen.type !== "coordinates" && (!locationInput.value.trim() || locationInput.value === autoFilled)) { locationInput.value = name; autoFilled = name; }
+      search.value = chosen.label;
+      clearSuggestions();
+    };
+    const show = (found, query) => {
+      suggestions = found; candidates.clearLayers();
+      if (!found.length) { results.innerHTML = `<li class="muted">No places match “${escapeHtml(query)}”. Click the map to drop a pin instead.</li>`; return; }
+      results.innerHTML = found.map((item, index) => `<li><button type="button" data-place="${index}"><span class="place-name">${escapeHtml(item.label)}</span><span class="place-detail">${escapeHtml([item.type, item.detail].filter(Boolean).join(" · "))}</span><span class="place-apply">Apply</span></button></li>`).join("");
+      found.forEach((item, index) => {
+        L.circleMarker([item.lat, item.lng], { radius: 8, color: "#fff", weight: 2, fillColor: "#C7A567", fillOpacity: 0.95, bubblingMouseEvents: false })
+          .bindTooltip(`${escapeHtml(item.label)} · click to apply`).on("click", () => apply(index)).addTo(candidates);
+      });
+      pickerMap.fitBounds(L.latLngBounds(found.map(item => [item.lat, item.lng])), { padding: [30, 30], maxZoom: 15 });
+    };
+    const runSearch = async explicit => {
+      const query = search.value.trim();
+      clearTimeout(typingTimer); pending?.abort();
+      const typed = places.coordinatePair(query);
+      if (typed) { show([{ label: `${typed[0]}, ${typed[1]}`, detail: "Typed coordinates", type: "coordinates", lat: typed[0], lng: typed[1] }], query); return; }
+      if (query.length < 3) { clearSuggestions(); if (explicit && query) results.innerHTML = '<li class="muted">Type at least 3 characters to search.</li>'; return; }
+      pending = new AbortController();
+      results.innerHTML = '<li class="muted">Searching…</li>';
+      try { show(await findPlaces(query, pending.signal, explicit), query); }
+      catch (error) { if (error.name !== "AbortError") results.innerHTML = '<li class="muted">Location search is unavailable right now. Click the map or type the coordinates instead.</li>'; }
+    };
+    const typedCoordinates = () => {
+      const point = places.coordinates(latitude.value, longitude.value);
+      if (point) place(point[0], point[1], Math.max(pickerMap.getZoom(), 15));
+      else if (!latitude.value && !longitude.value) clear();
+      else status.textContent = "Enter both latitude (-90 to 90) and longitude (-180 to 180).";
+    };
+    const saved = places.coordinates(latitude.value, longitude.value);
+    if (saved) place(saved[0], saved[1], 15);
     else {
-      clear();
+      describe();
       if (locations.length) pickerMap.fitBounds(L.latLngBounds(locations.map(item => [item.latitude, item.longitude])), { padding: [30, 30], maxZoom: 12 });
       else pickerMap.setView([20, 0], 2);
     }
-    pickerMap.on("click", event => place(event.latlng.lat, event.latlng.lng));
+    addBasemap(pickerMap);
+    pickerMap.on("click", event => { clearSuggestions(); place(event.latlng.lat, event.latlng.lng); });
     $("#clear-location").onclick = clear;
-    const search = async () => {
-      const query = $('#form-fields [name="location_search"]').value.trim(), results = $("#map-search-results");
-      if (!query) return;
-      results.innerHTML = '<li class="muted">Searching…</li>';
-      try {
-        const params = new URLSearchParams({ format: "jsonv2", limit: "5", q: query, "accept-language": navigator.language || "en" });
-        const response = await fetch(`https://nominatim.openstreetmap.org/search?${params}`);
-        if (!response.ok) throw new Error();
-        const places = await response.json();
-        results.innerHTML = places.map(item => `<li><button type="button" data-lat="${escapeHtml(item.lat)}" data-lng="${escapeHtml(item.lon)}" data-name="${escapeHtml(item.display_name)}">${escapeHtml(item.display_name)}</button></li>`).join("") || '<li class="muted">No places found. Click the map to set the location instead.</li>';
-      } catch { results.innerHTML = '<li class="muted">Location search is unavailable. Click the map to set the location instead.</li>'; }
+    $("#map-search-button").onclick = () => runSearch(true);
+    search.oninput = () => { clearTimeout(typingTimer); typingTimer = setTimeout(() => runSearch(false), 450); };
+    search.onkeydown = event => {
+      if (event.key === "Enter") { event.preventDefault(); runSearch(true); }
+      if (event.key === "Escape" && suggestions.length) { event.preventDefault(); clearSuggestions(); }
     };
-    $("#map-search-button").onclick = search;
-    $('#form-fields [name="location_search"]').onkeydown = event => { if (event.key === "Enter") { event.preventDefault(); search(); } };
-    $("#map-search-results").onclick = event => {
-      const result = event.target.closest("[data-lat]");
-      if (!result) return;
-      place(Number(result.dataset.lat), Number(result.dataset.lng), 16);
-      const locationInput = $('#form-fields [name="location"]');
-      if (!locationInput.value.trim()) locationInput.value = result.dataset.name.slice(0, 500);
-      $("#map-search-results").innerHTML = "";
-    };
+    results.onclick = event => { const choice = event.target.closest("[data-place]"); if (choice) apply(Number(choice.dataset.place)); };
+    latitude.onchange = typedCoordinates; longitude.onchange = typedCoordinates;
     setTimeout(() => pickerMap?.invalidateSize(), 60);
   }
   async function saveRecord(event) {
@@ -367,8 +683,9 @@
       const engineer = engineers.find(item => item.id === values.engineer_choice);
       values.engineer_name = engineer ? engineer.full_name : (values.engineer_other || "").trim();
       values.assigned_engineer_ids = engineer ? [engineer.id] : [];
-      values.latitude = values.latitude === "" ? null : Number(values.latitude);
-      values.longitude = values.longitude === "" ? null : Number(values.longitude);
+      const point = places.coordinates(values.latitude, values.longitude);
+      if (!point && (values.latitude || values.longitude)) { $("#form-message").textContent = "Enter both latitude and longitude, or clear the location."; return; }
+      [values.latitude, values.longitude] = point || [null, null];
       ["engineer_choice", "engineer_other", "location_search"].forEach(key => delete values[key]);
     }
     Object.keys(values).forEach(key => { if (values[key] === "") delete values[key]; });
@@ -378,8 +695,7 @@
       await request(`/${resources[page].path}${editingId ? `/${editingId}` : ""}`, { method: editingId ? "PATCH" : "POST", body: JSON.stringify(values) });
       $("#record-dialog").close(); await loadRecords(); await loadClients();
       if (page === "Engineers") await loadEngineers();
-      if (["Projects", "Cleaning Records", "Water Testing"].includes(page)) loadTasks();
-      if (page === "Projects") loadLocations();
+      if (page === "Projects") await loadProjectOptions();
     } catch (error) { $("#form-message").textContent = error.message; }
   }
   async function openCompletionForm(projectId, readOnly = false) {
@@ -433,7 +749,7 @@
   async function refreshAfterApprovalChange() {
     if (resources[page]) await loadRecords();
     if (page === "Approvals") await renderApprovals();
-    await loadTasks();
+    if (page === "Dashboard") refreshDashboard();
   }
   async function submitCompletion(event) {
     event.preventDefault();
@@ -484,58 +800,106 @@
   async function renderApprovals() {
     try {
       const [pending, history] = await Promise.all([request("/approvals"), request("/approval-history")]);
-      records = pending.data || [];
-      records.forEach(record => { record.client_name ||= clients.find(client => client.id === record.client_id)?.name || ""; });
-      $("#approval-count").textContent = `${records.length} awaiting`;
-      $("#approval-body").innerHTML = records.map(record => `<tr><td><strong>${escapeHtml(record.client_name)}</strong></td><td><strong>${escapeHtml(record.name)}</strong></td><td>${escapeHtml(record.engineer_name)}</td><td>${escapeHtml(record.completion_status)}${record.additional_duration ? ` (+${escapeHtml(record.additional_duration)} day(s))` : ""}</td><td>${escapeHtml(record.invoice_number || "—")}</td><td><button data-project-images="${escapeHtml(record.id)}">View Completion</button>${decisionButtons(record, false)}</td></tr>`).join("") || '<tr><td colspan="6">No completions are awaiting approval.</td></tr>';
-      $("#history-body").innerHTML = (history.data || []).map(entry => `<tr><td>${escapeHtml(formatDateTime(entry.created_at))}</td><td>${escapeHtml(entry.reference)}</td><td>${escapeHtml(entry.previous_status)} → ${escapeHtml(entry.new_status)}</td><td>${escapeHtml(entry.action)}</td><td>${escapeHtml(entry.actor_name)}</td><td>${escapeHtml(entry.reason || "")}</td></tr>`).join("") || '<tr><td colspan="6">No approval activity yet.</td></tr>';
+      approvalItems = pending.data || [];
+      approvalItems.forEach(record => { record.client_name ||= clients.find(client => client.id === record.client_id)?.name || ""; });
+      approvalHistory = history.data || [];
+      records = approvalItems;
+      renderApprovalTables();
     } catch (error) { showError(error.message); }
+  }
+  function renderApprovalTables() {
+    const { search, client, project, from, to } = filterValues();
+    const clientOf = projectId => projectOptions.find(item => item.id === projectId)?.client_id;
+    const shown = approvalItems.filter(record => (!client || record.client_id === client) && (!project || record.id === project)
+      && inDateRange((record.updated_at || "").slice(0, 10), from, to)
+      && textMatches([record.client_name, record.name, record.engineer_name, record.completion_status, record.invoice_number, record.so_no], search));
+    const history = approvalHistory.filter(entry => (!client || clientOf(entry.project_id) === client) && (!project || entry.project_id === project)
+      && inDateRange((entry.created_at || "").slice(0, 10), from, to)
+      && textMatches([entry.reference, entry.action, entry.actor_name, entry.reason, entry.previous_status, entry.new_status], search));
+    const filtered = Boolean(search || client || project || from || to);
+    $("#approval-count").textContent = `${shown.length} awaiting`;
+    $("#approval-body").innerHTML = shown.map(record => `<tr><td><strong>${escapeHtml(record.client_name)}</strong></td><td><strong>${escapeHtml(record.name)}</strong></td><td>${escapeHtml(record.engineer_name)}</td><td>${escapeHtml(record.completion_status)}${record.additional_duration ? ` (+${escapeHtml(record.additional_duration)} day(s))` : ""}</td><td>${escapeHtml(record.invoice_number || "—")}</td><td><button data-project-images="${escapeHtml(record.id)}">View Completion</button>${decisionButtons(record, false)}</td></tr>`).join("") || `<tr><td colspan="6">${filtered ? "No completions awaiting approval match these filters." : "No completions are awaiting approval."}</td></tr>`;
+    $("#history-body").innerHTML = history.map(entry => `<tr><td>${escapeHtml(formatDateTime(entry.created_at))}</td><td>${escapeHtml(entry.reference)}</td><td>${escapeHtml(entry.previous_status)} → ${escapeHtml(entry.new_status)}</td><td>${escapeHtml(entry.action)}</td><td>${escapeHtml(entry.actor_name)}</td><td>${escapeHtml(entry.reason || "")}</td></tr>`).join("") || `<tr><td colspan="6">${filtered ? "No approval activity matches these filters." : "No approval activity yet."}</td></tr>`;
+  }
+  function fitProjects() {
+    projectMap.invalidateSize();
+    if (locations.length) projectMap.fitBounds(L.latLngBounds(locations.map(item => [item.latitude, item.longitude])), { padding: [40, 40], maxZoom: 14 });
+    else projectMap.setView([20, 0], 2);
   }
   function ensureProjectMap() {
     if (!window.L) { $("#map-message").textContent = "The map could not load. Check the internet connection and reload the page."; return null; }
     if (!projectMap) {
-      projectMap = L.map("project-map", { scrollWheelZoom: false }).setView([20, 0], 2);
-      mapTiles(projectMap);
-      projectMarkers = L.layerGroup().addTo(projectMap);
+      projectMap = L.map("project-map", { scrollWheelZoom: true, zoomControl: false, minZoom: 2, maxZoom: 19 }).setView([20, 0], 2);
+      L.control.zoom({ position: "topleft" }).addTo(projectMap);
+      fitButton(fitProjects).addTo(projectMap);
+      watchSize(projectMap);
+      addBasemap(projectMap);
+      projectMarkers = (L.markerClusterGroup
+        ? L.markerClusterGroup({ showCoverageOnHover: false, maxClusterRadius: 45, spiderfyOnMaxZoom: true, iconCreateFunction: clusterIcon })
+        : L.layerGroup()).addTo(projectMap);
     }
     setTimeout(() => projectMap.invalidateSize(), 0);
     return projectMap;
   }
   function popupHtml(item) {
+    const key = statusKey(item), id = escapeHtml(item.id);
     const rows = [
       ["Engineer", item.engineer_name || "Engineer not assigned"],
       ["Task", [item.service, item.so_no != null ? `SO ${item.so_no}` : "", item.start_date ? `${item.start_date} to ${item.end_date || item.start_date}` : "", item.visit_time ? `visit ${item.visit_time}` : ""].filter(Boolean).join(" · ")],
       ["Engineer visit", scheduleText(item, FREQUENCY_GROUPS[0])],
       ["Details", item.system_details || item.description],
-      ["Status", [item.status, item.approval_status].filter(Boolean).join(" · ")],
       ["Location", item.location || `${Number(item.latitude).toFixed(5)}, ${Number(item.longitude).toFixed(5)}`],
     ].filter(([, value]) => value);
-    return `<div class="map-popup"><strong>${escapeHtml(item.client_name || "Client not set")}</strong><strong class="project-name">${escapeHtml(item.name)}</strong><dl>${rows.map(([label, value]) => `<dt>${escapeHtml(label)}</dt><dd>${escapeHtml(value)}</dd>`).join("")}</dl></div>`;
+    const action = canEdit()
+      ? `<button type="button" class="primary map-card-action" data-project-edit="${id}">Open project</button>`
+      : `<button type="button" class="outline map-card-action" data-project-images="${id}">View completion</button>`;
+    return `<div class="map-card"><strong class="map-card-client">${escapeHtml(item.client_name || "Client not set")}</strong><strong class="map-card-project">${escapeHtml(item.name)}</strong><div class="map-card-badges"><span class="status-badge approval-${key}">${escapeHtml(STATUS_LABELS[key] || item.approval_status)}</span>${item.status ? `<span class="status-badge project-status">${escapeHtml(item.status)}</span>` : ""}</div><dl>${rows.map(([label, value]) => `<dt>${escapeHtml(label)}</dt><dd>${escapeHtml(value)}</dd>`).join("")}</dl>${action}</div>`;
+  }
+  function renderLegend() {
+    const counts = locations.reduce((totals, item) => ({ ...totals, [statusKey(item)]: (totals[statusKey(item)] || 0) + 1 }), {});
+    const shown = ["pending", "submitted-for-approval", "approved", "rejected", "completed"].filter(key => key !== "completed" || counts.completed);
+    $("#map-legend").innerHTML = locations.length ? shown.map(key => `<span class="legend-item"><span class="legend-dot status-${key}"></span>${escapeHtml(STATUS_LABELS[key])}<b>${counts[key] || 0}</b></span>`).join("") : "";
   }
   async function loadLocations() {
-    const map = ensureProjectMap();
     const params = new URLSearchParams();
     if ($("#client-filter").value) params.set("client_id", $("#client-filter").value);
-    try { locations = (await request(`/dashboard/locations?${params}`)).data || []; }
+    try { allLocations = (await request(`/dashboard/locations?${params}`)).data || []; }
     catch (error) { $("#map-message").textContent = error.message; return; }
+    applyMapFilters();
+  }
+  function applyMapFilters() {
+    const map = ensureProjectMap(), { search, project } = filterValues(), day = dayMode ? isoDate(selectedDate) : "";
+    locations = allLocations.filter(item => (!project || item.id === project)
+      && textMatches([item.client_name, item.name, item.engineer_name, item.location, item.service, item.so_no, item.system_details, item.status, item.approval_status], search)
+      && (!day || (item.start_date && item.start_date <= day && (item.end_date || item.start_date) >= day)));
     $("#map-count").textContent = `${locations.length} located project${locations.length === 1 ? "" : "s"}`;
+    renderLegend();
     if (!map) return;
     projectMarkers.clearLayers();
-    locations.forEach(item => {
-      L.marker([item.latitude, item.longitude], { icon: pinIcon(), title: `${item.client_name || ""} · ${item.name}`, alt: `${item.client_name || ""} · ${item.name}` })
-        .bindPopup(popupHtml(item), { maxWidth: 280 }).addTo(projectMarkers);
+    projectMap.invalidateSize();
+    // A card bigger than the map makes Leaflet pan the pin out of view, which closes the card on phones.
+    const size = projectMap.getSize(), cardWidth = Math.max(170, Math.min(260, size.x - 50)), cardHeight = Math.max(160, size.y - 90);
+    const markers = locations.map(item => {
+      const key = statusKey(item), label = `${item.client_name || ""} · ${item.name} (${STATUS_LABELS[key]})`;
+      return L.marker([item.latitude, item.longitude], { icon: pinIcon(key), title: label, alt: label })
+        .bindPopup(popupHtml(item), { className: `wc-popup popup-${key}`, maxWidth: cardWidth, minWidth: cardWidth, maxHeight: cardHeight, autoPanPadding: [16, 16] });
     });
-    $("#map-message").textContent = locations.length ? "" : "No project has a saved map location yet. Edit a project to add one.";
-    if (locations.length) projectMap.fitBounds(L.latLngBounds(locations.map(item => [item.latitude, item.longitude])), { padding: [30, 30], maxZoom: 14 });
+    if (projectMarkers.addLayers) projectMarkers.addLayers(markers);
+    else markers.forEach(marker => marker.addTo(projectMarkers));
+    $("#map-message").textContent = locations.length ? ""
+      : allLocations.length ? "No located projects match these filters." : "No project has a saved map location yet. Edit a project to add one.";
+    fitProjects();
   }
   function renderReports() {
     $("#records-title").textContent = "Reports & exports";
+    $("#records-count").textContent = "Downloads use the filters above";
     $("#table-head").innerHTML = "<tr><th>Report</th><th>File format</th><th>Action</th></tr>";
     const choices = [["Projects","projects"],["Tank cleaning","cleaning"],["Water testing","water-testing"],["Clients","clients"]];
     $("#table-body").innerHTML = choices.map(([label, value]) => `<tr><td>${label}</td><td>CSV · Excel · PDF</td><td>${["csv","xlsx","pdf"].map(format => `<a href="${api}/reports/export?resource=${value}&format=${format}" data-report="${value}" data-format="${format}">${format.toUpperCase()}</a>`).join(" · ")}</td></tr>`).join("");
   }
   async function renderSettings() {
     $("#records-title").textContent = "Settings";
+    $("#records-count").textContent = "";
     $("#table-head").innerHTML = "<tr><th>Preference</th><th>Value</th></tr>";
     try {
       const settings = await request("/settings");
@@ -591,21 +955,26 @@
       openForm();
     } else if (button) navigate(button.dataset.page);
   };
-  $("#today").onclick = () => { selectedDate = new Date(); month = new Date(); loadTasks(); };
+  $("#today").onclick = () => selectDay(isoDate(new Date()));
+  $("#all-dates").onclick = showAllDates;
   $("#date-filter").onchange = () => {
     const value = $("#date-filter").value;
-    if (!/^\d{4}-\d{2}-\d{2}$/.test(value)) return;
-    const [year, monthNumber, day] = value.split("-").map(Number);
-    selectedDate = new Date(year, monthNumber - 1, day);
-    if (year !== month.getFullYear() || monthNumber - 1 !== month.getMonth()) { month = new Date(year, monthNumber - 1, 1); loadTasks(); }
-    else { renderCalendar(); renderTask(); }
+    if (/^\d{4}-\d{2}-\d{2}$/.test(value)) selectDay(value);
+    else if (!value) showAllDates();
   };
+  $("#search-filter").oninput = () => { clearTimeout(filterTimer); filterTimer = setTimeout(applyFilters, 300); };
+  ["#client-filter", "#project-filter", "#from-filter", "#to-filter"].forEach(id => { $(id).onchange = applyFilters; });
+  $("#clear-filters").onclick = () => { resetFilters(); if (page === "Dashboard") renderCalendar(); applyFilters(); };
+  $("#reset-order").onclick = resetOrder;
+  $("#reset-order-dashboard").onclick = resetOrder;
+  enableReorder($("#task-list"));
+  enableReorder($("#table-body"));
   $("#clients-link").onclick = () => navigate("Clients");
-  $("#client-filter").onchange = () => { loadTasks(); loadLocations(); };
-  $("#previous-month").onclick = () => { month = new Date(month.getFullYear(), month.getMonth() - 1, 1); selectedDate = new Date(month); loadTasks(); };
-  $("#next-month").onclick = () => { month = new Date(month.getFullYear(), month.getMonth() + 1, 1); selectedDate = new Date(month); loadTasks(); };
+  $("#previous-month").onclick = () => { month = new Date(month.getFullYear(), month.getMonth() - 1, 1); loadTasks(); };
+  $("#next-month").onclick = () => { month = new Date(month.getFullYear(), month.getMonth() + 1, 1); loadTasks(); };
   // Wrapped so a false return never cancels the click (which would stop <details> items from expanding).
   $("#task-list").onclick = event => { handleProjectAction(event); };
+  $("#project-map").onclick = event => { if (handleProjectAction(event)) projectMap?.closePopup(); };
   $("#approvals").onclick = event => { handleProjectAction(event); };
   $("#add-record").onclick = () => openForm();
   $("#close-dialog").onclick = () => $("#record-dialog").close();
@@ -616,7 +985,6 @@
   $("#reject-form").onsubmit = submitRejection;
   $("#completion-status").onchange = updateDurationVisibility;
   ["expected-duration", "completed-duration"].forEach(id => { $(`#${id}`).oninput = updateDurationVisibility; });
-  $("#search").oninput = () => { if (resources[page]) loadRecords(); };
   $("#table-body").onclick = async event => {
     if (handleProjectAction(event)) return;
     const addProject = event.target.closest("[data-add-project]");
@@ -625,22 +993,23 @@
     if (deleteProject && confirm("Permanently delete this project, its project tasks, and all saved project documents? This cannot be undone.")) {
       try {
         await request(`/projects/${deleteProject.dataset.projectDelete}/permanent`, { method: "DELETE" });
-        await loadRecords();
-        await loadTasks();
+        await Promise.all([loadRecords(), loadProjectOptions()]);
       } catch (error) { showError(error.message); }
       return;
     }
     const edit = event.target.closest("[data-edit]"), remove = event.target.closest("[data-delete]");
     if (edit) openForm(edit.dataset.edit);
     if (remove && confirm("Archive this record? Historical records are retained.")) {
-      try { await request(`/${resources[page].path}/${remove.dataset.delete}`, { method: "DELETE" }); await loadRecords(); if (["Projects", "Cleaning Records", "Water Testing"].includes(page)) loadTasks(); }
+      try { await request(`/${resources[page].path}/${remove.dataset.delete}`, { method: "DELETE" }); await loadRecords(); if (page === "Projects") await loadProjectOptions(); }
       catch (error) { showError(error.message); }
     }
     const report = event.target.closest("[data-report]");
     if (report) {
       event.preventDefault();
       try {
-        const response = await fetch(report.href, { credentials: "same-origin" });
+        // Exports follow the filter bar, keeping only the filters each report supports.
+        const params = filterParams(REPORT_FILTERS[report.dataset.report] || []);
+        const response = await fetch(`${report.href}${params.toString() ? `&${params}` : ""}`, { credentials: "same-origin" });
         if (!response.ok) throw new Error("Report export failed.");
         const blob = await response.blob(), link = document.createElement("a");
         link.href = URL.createObjectURL(blob); link.download = `watercare-${report.dataset.report}-report.${report.dataset.format}`; link.click(); URL.revokeObjectURL(link.href);

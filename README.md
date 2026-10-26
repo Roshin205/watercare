@@ -41,6 +41,8 @@ Schema changes must be reviewed and committed as Alembic revisions. Use `flask -
 
 Revision `202610260006` adds Engineer IDs (unique per organization), custom schedule dates, invoice numbers, approval status and rejection reason, project latitude/longitude, and the `approval_history` table. It only adds columns and tables. Existing projects keep their Monthly/Weekly schedule values; projects that are not yet completed start with approval status `Pending`, and projects completed before approvals existed keep a blank approval status. Any `manager` accounts become `service_coordinator` accounts. Run `flask --app main:app db upgrade` locally and as the Render pre-deploy step to apply it.
 
+Revision `202610270007` adds the project priority date and rank used to persist manual work-order changes. It adds columns only; existing projects remain in date order until someone reorders them.
+
 ## Authentication and access control
 
 Flask stores authenticated employee identity in a signed, HTTP-only session cookie. Mutating API requests also require the session CSRF token. The server reloads the account and active organization membership for each request and enforces role permissions and organization scoping on every API call; the interface only hides controls a role cannot use.
@@ -57,6 +59,12 @@ A completion submission sets the project's approval status to **Submitted for Ap
 
 There is no public registration route. Create accounts only for authorized employees. For a password reset, verify the employee through the organization’s normal process and run the `set-password` CLI command on the deployed service or from a trusted operator environment.
 
+## Project work order and filters
+
+The Projects page and dashboard list projects by scheduled date, with a bold date heading for each group. Service Coordinators, Accountants, and Administrators can drag a project's handle to reorder work within or across dates; touch dragging and keyboard arrow keys are supported as well. The shared order is saved in the database. If a project is rescheduled, it returns to its new date group. Use **Reset to date order** to clear manual ordering and restore the scheduled-date order.
+
+The dashboard starts with all projects. Choose a calendar day or use the date field to show work for one day; **All dates** returns to the full list. List pages provide search, client, project, and date-range filters. Search checks project and client names, sites, engineer names, and SO numbers. Report downloads and the dashboard map use the active filters too. The dashboard filter uses one date rather than a date range, and includes **Today** and **All dates** shortcuts.
+
 ## Documents
 
 The application stores uploads under `STORAGE_PATH` and stores metadata and organization associations in PostgreSQL. Files are served only through an authenticated, organization-scoped route. Render's default filesystem is ephemeral; configure and mount a persistent disk before enabling production uploads, and keep its mount path synchronized with `STORAGE_PATH`. The existing bucket named `Water-managment` could not be identified from this source repository: its storage provider and credentials must be verified with the bucket owner before it can be reused. No external storage integration or credentials are assumed.
@@ -65,11 +73,25 @@ Back up the PostgreSQL database and persistent disk independently, and periodica
 
 ## Project map
 
-Project locations are chosen on an interactive map in the project form and stored as latitude/longitude in the database; the dashboard shows a marker for every project that has a saved location. The map uses free services that need **no API key**:
+Project locations are set in the project form and stored as latitude/longitude in the database. The dashboard map shows a pin for every located project, coloured by approval status (grey Pending, gold Awaiting approval, green Approved, red Rejected) with a legend and counts underneath. Nearby pins are grouped into a numbered circle that splits as you zoom in, and each pin opens a card with the client, project, engineer, task details, status and location, plus a button to open the project (or view its completion for view-only roles). In the form, a user can:
 
-- [Leaflet](https://leafletjs.com) 1.9.4, loaded from unpkg with a Subresource Integrity hash.
-- [OpenStreetMap](https://www.openstreetmap.org) map tiles, used under the [tile usage policy](https://operations.osmfoundation.org/policies/tiles/) (attribution shown on the map, light traffic only).
-- [Nominatim](https://nominatim.org) place search, called from the browser only when someone presses Search, under its [usage policy](https://operations.osmfoundation.org/policies/nominatim/) (at most one request per second, no autocomplete). Search text is sent to OpenStreetMap's servers.
+- type a place or address and pick from the suggestions that appear (each one is also shown as a gold dot on the map; **Apply** or click the dot to use it),
+- click the map to drop a pin manually and drag the pin to the exact spot,
+- type latitude and longitude, or paste a pair such as `25.2854, 51.531` into the search box.
+
+Use the mouse wheel to zoom either the dashboard map or the project-form map.
+
+The map uses free services that need **no API key**:
+
+- [Leaflet](https://leafletjs.com) 1.9.4 with [Leaflet.markercluster](https://github.com/Leaflet/Leaflet.markercluster) 1.5.3 for grouped pins.
+- [OpenFreeMap](https://openfreemap.org) "Positron" vector basemap (free, no registration, attribution shown on the map), drawn by [MapLibre GL JS](https://maplibre.org) 5.24.0 through the [maplibre-gl-leaflet](https://github.com/maplibre/maplibre-gl-leaflet) 0.1.4 bridge. The app recolours it to WaterCare's cream, teal and sage, and shows place names in English (falling back to Latin transliteration, then the local name).
+- If the vector map cannot load (no WebGL, a blocked CDN or an OpenFreeMap outage), the map falls back to toned-down [OpenStreetMap](https://www.openstreetmap.org) tiles under the [tile usage policy](https://operations.osmfoundation.org/policies/tiles/).
+
+All map libraries load from unpkg with Subresource Integrity hashes.
+- [Photon](https://photon.komoot.io) by komoot for the suggestions while typing (a 450 ms pause after typing, at least 3 characters, results biased toward the area shown on the map). The public server is free for fair use and may throttle heavy use.
+- [Nominatim](https://nominatim.org) as a backup when the Search button finds nothing through Photon, under its [usage policy](https://operations.osmfoundation.org/policies/nominatim/) (one request per press, never while typing).
+
+Search text is sent to these OpenStreetMap-based services.
 
 If usage grows beyond those policies, switch the tile URL in `static/js/app.js` to a commercial provider (for example MapTiler or Stadia Maps). Those services issue browser keys that are public by design; restrict such a key to your site's domain in the provider's dashboard and never place a secret or server key in frontend code. Without internet access the map shows a message and the rest of the project form still saves.
 
