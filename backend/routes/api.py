@@ -1,7 +1,9 @@
 import csv
 import io
+import os
 import re
 import secrets
+import tempfile
 import uuid
 import zipfile
 from datetime import date, datetime, timezone
@@ -14,21 +16,35 @@ from werkzeug.security import generate_password_hash
 from werkzeug.utils import secure_filename
 
 from backend.database import db as sqlalchemy_db
-from backend.models import engineers, memberships, users
+from backend.models import (
+    approval_history, engineers, memberships, project_engineers, project_tasks, projects,
+    uploaded_documents, users, water_testing_records,
+)
 from backend.security.authentication import login, require_user
-from backend.utils.validators import RESOURCE_FIELDS, validate_payload
+from backend.utils.validators import (
+    APPROVAL_STATUSES, FREQUENCY_FIELDS, RESOURCE_FIELDS, validate_payload, validate_settings,
+)
 
 api = Blueprint("api", __name__)
 ADMIN = {"administrator"}
-MANAGERS = {"administrator", "manager"}
+# Service Coordinators and Accountants are the two administrative roles: they view, edit, approve and reject.
+# Every other role (employee, viewer) is view-only; employees may also submit completions for their own projects.
+EDITORS = {"administrator", "service_coordinator", "accountant"}
+APPROVERS = EDITORS
+ACCOUNT_ROLES = {"service_coordinator", "accountant", "employee", "viewer"}
+COMPLETION_FIELDS = {"completion_status", "expected_duration", "completed_duration", "additional_duration", "invoice_number"}
 RESOURCES = {
-    "clients": ("clients", MANAGERS),
-    "engineers": ("engineers", MANAGERS),
-    "projects": ("projects", MANAGERS),
-    "project_tasks": ("project_tasks", MANAGERS),
-    "cleaning-records": ("cleaning_records", MANAGERS),
-    "water-testing": ("water_testing_records", MANAGERS),
+    "clients": ("clients", EDITORS),
+    "engineers": ("engineers", EDITORS),
+    "projects": ("projects", EDITORS),
+    "project_tasks": ("project_tasks", EDITORS),
+    "cleaning-records": ("cleaning_records", EDITORS),
+    "water-testing": ("water_testing_records", EDITORS),
 }
+
+
+class ApprovalConflict(Exception):
+    pass
 
 
 def db():
@@ -49,15 +65,22 @@ def scoped_query(table, select="*"):
     query = db().table(table).select(select).eq("organization_id", g.organization_id).is_("deleted_at", "null")
     if g.role == "employee":
         engineer_ids = (
-            db().table("engineers").select("id").eq("organization_id", g.organization_id)
+            db().table("engineers").select("id,full_name").eq("organization_id", g.organization_id)
             .eq("user_id", g.user.id).eq("is_active", True).is_("deleted_at", "null").execute().data or []
         )
+        engineer_names = [engineer["full_name"] for engineer in engineer_ids]
         engineer_ids = [engineer["id"] for engineer in engineer_ids]
         if table == "projects":
             assignments = db().table("project_engineers").select("project_id").eq(
                 "organization_id", g.organization_id
             ).in_("engineer_id", engineer_ids).execute().data if engineer_ids else []
-            project_ids = [assignment["project_id"] for assignment in assignments or []]
+            project_ids = {assignment["project_id"] for assignment in assignments or []}
+            if engineer_names:
+                named_projects = db().table("projects").select("id").eq(
+                    "organization_id", g.organization_id
+                ).in_("engineer_name", engineer_names).is_("deleted_at", "null").execute().data or []
+                project_ids.update(project["id"] for project in named_projects)
+            project_ids = list(project_ids)
             query = query.in_("id", project_ids) if project_ids else query.eq("id", "00000000-0000-0000-0000-000000000000")
         elif table == "project_tasks":
             assignments = db().table("project_engineers").select("project_id").eq(
@@ -147,7 +170,7 @@ def create_user():
         not isinstance(email, str) or len(email) > 320 or not re.fullmatch(r"[^@\s]+@[^@\s]+\.[^@\s]+", email)
         or not isinstance(full_name, str) or not full_name.strip() or len(full_name) > 255
         or not isinstance(password, str) or not 12 <= len(password) <= 512
-        or role not in {"manager", "employee"}
+        or role not in ACCOUNT_ROLES
     ):
         return failure("invalid_request", "Use a valid email, name, role, and password of at least 12 characters.", 400)
     existing = sqlalchemy_db.session.execute(select(users.c.id).where(users.c.email == email.lower())).first()
@@ -164,11 +187,13 @@ def create_user():
             id=str(uuid4()), organization_id=g.organization_id, user_id=user_id,
             role=role, status="active", created_at=now,
         ))
-        sqlalchemy_db.session.execute(engineers.insert().values(
-            id=str(uuid4()), organization_id=g.organization_id, user_id=user_id,
-            full_name=full_name.strip(), email=email.lower(), is_active=True,
-            created_by=g.user.id, updated_by=g.user.id, created_at=now, updated_at=now,
-        ))
+        if role == "employee":
+            # Employees see work through their engineer profile; its Engineer ID is added later on the Engineers page.
+            sqlalchemy_db.session.execute(engineers.insert().values(
+                id=str(uuid4()), organization_id=g.organization_id, user_id=user_id,
+                full_name=full_name.strip(), email=email.lower(), is_active=True,
+                created_by=g.user.id, updated_by=g.user.id, created_at=now, updated_at=now,
+            ))
         sqlalchemy_db.session.commit()
         return jsonify({"data": {"id": user_id, "email": email.lower(), "full_name": full_name.strip(), "role": role}}), 201
     except Exception:
@@ -238,16 +263,14 @@ def dashboard_tasks():
     if start > end:
         return failure("invalid_request", "from must not be after to.", 400)
     try:
-        projects = scoped_query(
-            "projects", "id,name,client_id,location,status,scheduled_date,scheduled_time,description"
-        )
+        projects = scoped_query("projects")
         if client_id:
             projects = projects.eq("client_id", client_id)
         project_rows = projects.execute().data or []
         tasks_query = scoped_query("project_tasks").gte("scheduled_date", start).lte("scheduled_date", end)
         task_rows = tasks_query.order("scheduled_date").limit(500).execute().data or []
         project_by_id = {p["id"]: p for p in project_rows}
-        client_ids = list({project["client_id"] for project in project_rows})
+        client_ids = list({project["client_id"] for project in project_rows if project.get("client_id")})
         clients = db().table("clients").select("id,name").eq(
             "organization_id", g.organization_id
         ).in_("id", client_ids).execute().data if client_ids else []
@@ -260,13 +283,28 @@ def dashboard_tasks():
             project_engineers.setdefault(assignment["project_id"], []).append(assignment["engineer_id"])
         results = []
         for project in project_rows:
-            scheduled_date = project.get("scheduled_date")
-            if scheduled_date and start <= scheduled_date <= end:
+            project_start = project.get("start_date")
+            project_end = project.get("end_date")
+            if project_start:
+                try:
+                    first_day = max(date.fromisoformat(project_start), date.fromisoformat(start))
+                    last_day = min(date.fromisoformat(project_end or project_start), date.fromisoformat(end))
+                except ValueError:
+                    current_app.logger.warning("Skipping project %s with an invalid date range.", project["id"])
+                    continue
+                project_dates = []
+                while first_day <= last_day:
+                    project_dates.append(first_day.isoformat())
+                    first_day = date.fromordinal(first_day.toordinal() + 1)
+            else:
+                scheduled_date = project.get("scheduled_date") or project.get("contract_period")
+                project_dates = [scheduled_date] if scheduled_date and start <= scheduled_date <= end else []
+            for scheduled_date in project_dates:
                 results.append({
                     "id": project["id"], "title": project["name"], "status": project.get("status"),
-                    "scheduled_date": scheduled_date, "scheduled_time": project.get("scheduled_time"),
+                    "scheduled_date": scheduled_date, "scheduled_time": project.get("visit_time") or project.get("scheduled_time"),
                     "location": project.get("location"), "description": project.get("description"),
-                    "project": {**project, "client_name": client_names.get(project["client_id"])},
+                    "project": {**project, "client_name": project.get("client_name") or client_names.get(project.get("client_id"))},
                     "engineer_ids": project_engineers.get(project["id"], []),
                     "record_type": "project",
                 })
@@ -274,7 +312,7 @@ def dashboard_tasks():
             project = project_by_id.get(task.get("project_id"))
             if project:
                 results.append({
-                    **task, "project": {**project, "client_name": client_names.get(project["client_id"])},
+                    **task, "project": {**project, "client_name": project.get("client_name") or client_names.get(project.get("client_id"))},
                     "engineer_ids": [task["engineer_id"]] if task.get("engineer_id") else project_engineers.get(project["id"], []),
                     "record_type": "task",
                 })
@@ -401,10 +439,17 @@ def collection(resource):
             return failure("invalid_request", validation, 400)
         if not isinstance(assigned_engineer_ids, list) or any(not isinstance(value, str) for value in assigned_engineer_ids):
             return failure("invalid_request", "assigned_engineer_ids must be a list of engineer IDs.", 400)
+        if resource == "engineers" and _engineer_code_taken(payload):
+            return failure("conflict", "Another engineer already uses this Engineer ID.", 409)
+        if resource == "projects" and "completion_status" in payload:
+            return failure("invalid_request", "Submit completion details after the project is created.", 400)
         try:
             if resource == "projects":
                 _validate_engineer_ids(assigned_engineer_ids)
             _validate_relationships(resource, payload)
+            if resource == "projects":
+                _resolve_project_client(payload)
+                _clear_unused_custom_dates(payload)
             payload = dict(payload)
             payload["organization_id"] = g.organization_id
             payload["created_by"] = g.user.id
@@ -447,45 +492,65 @@ def item(resource, item_id):
 
     @require_user()
     def patch_item():
+        submitter = resource == "projects" and g.role == "employee"
+        if g.role not in write_roles and not submitter:
+            return failure("forbidden", "Your account has view-only access and cannot change records.", 403)
         payload = request.get_json(silent=True)
-        if g.role not in write_roles:
-            if resource != "project_tasks" or g.role != "employee":
-                return failure("forbidden", "Your role cannot update this record.", 403)
-            if not isinstance(payload, dict) or set(payload) - {"status", "notes"}:
-                return failure("forbidden", "Employees may only update task status and notes.", 403)
-            if "status" in payload and payload["status"] not in {"Scheduled", "In Progress", "Completed", "On Hold", "Cancelled"}:
-                return failure("invalid_request", "Unsupported task status.", 400)
-            if not payload:
-                return failure("invalid_request", "Provide task status or notes.", 400)
-            engineer_rows = db().table("engineers").select("id").eq(
-                "organization_id", g.organization_id
-            ).eq("user_id", g.user.id).eq("is_active", True).is_("deleted_at", "null").execute().data or []
-            own_engineer_ids = [row["id"] for row in engineer_rows]
-            assigned_task = db().table("project_tasks").select("id").eq(
-                "organization_id", g.organization_id
-            ).eq("id", item_id).in_("engineer_id", own_engineer_ids).is_("deleted_at", "null").execute().data if own_engineer_ids else []
-            if not assigned_task:
-                return failure("not_found", "Assigned task not found.", 404)
-        assigned_engineer_ids = payload.get("assigned_engineer_ids") if isinstance(payload, dict) and resource == "projects" else None
-        if isinstance(payload, dict) and resource == "projects":
-            payload = {key: value for key, value in payload.items() if key != "assigned_engineer_ids"}
-        validation = validate_payload(rule_resource, payload, partial=True)
+        if not isinstance(payload, dict) or not payload:
+            return failure("invalid_request", "Provide at least one field to update.", 400)
+        submitting = resource == "projects" and "completion_status" in payload
+        if g.role not in write_roles and (not submitting or set(payload) - COMPLETION_FIELDS):
+            return failure("forbidden", "Employees may only submit completion details for their assigned projects.", 403)
+        try:
+            current_rows = record(table, item_id)
+        except Exception:
+            current_app.logger.exception("Record lookup failed.")
+            return failure("database_error", "Record could not be updated.", 503)
+        if not current_rows:
+            return failure("not_found", "Record not found.", 404)
+        current = current_rows[0]
+        assigned_engineer_ids = payload.pop("assigned_engineer_ids", None) if resource == "projects" else None
+        if submitting:
+            if current.get("approval_status") == "Submitted for Approval":
+                return failure("conflict", "This completion is already awaiting approval.", 409)
+            if current.get("approval_status") == "Approved":
+                return failure("conflict", "This completion has already been approved.", 409)
+            try:
+                payload = _completion_values(payload)
+            except ValueError as error:
+                return failure("invalid_request", str(error), 400)
+        validation = validate_payload(rule_resource, payload, partial=True, current=current if resource == "projects" else None)
         if validation:
             return failure("invalid_request", validation, 400)
+        if resource == "projects" and {"start_date", "end_date"} & set(payload):
+            project_start = payload.get("start_date", current.get("start_date"))
+            project_end = payload.get("end_date", current.get("end_date"))
+            if project_start and project_end and project_start > project_end:
+                return failure("invalid_request", "end_date must be on or after start_date.", 400)
         if assigned_engineer_ids is not None and (
             not isinstance(assigned_engineer_ids, list) or any(not isinstance(value, str) for value in assigned_engineer_ids)
         ):
             return failure("invalid_request", "assigned_engineer_ids must be a list of engineer IDs.", 400)
         if not payload and assigned_engineer_ids is None:
             return failure("invalid_request", "Provide at least one field to update.", 400)
+        if resource == "engineers" and "engineer_code" in payload and _engineer_code_taken(payload, item_id):
+            return failure("conflict", "Another engineer already uses this Engineer ID.", 409)
         try:
             if resource == "projects" and assigned_engineer_ids is not None:
                 _validate_engineer_ids(assigned_engineer_ids)
             _validate_relationships(resource, payload)
-            updated = record(table, item_id)
-            if not updated:
-                return failure("not_found", "Record not found.", 404)
-            if payload:
+            if resource == "projects" and "client_name" in payload:
+                _resolve_project_client(payload)
+            if resource == "projects":
+                _clear_unused_custom_dates(payload)
+            updated = None
+            if submitting:
+                previous = current.get("approval_status")
+                updated = _change_approval(
+                    current, "Submitted for Approval", "Resubmitted" if previous == "Rejected" else "Submitted",
+                    {**payload, "rejection_reason": None},
+                )
+            elif payload:
                 payload["updated_by"] = g.user.id
                 updated = (
                     db().table(table).update(payload).eq("organization_id", g.organization_id)
@@ -494,6 +559,8 @@ def item(resource, item_id):
             if resource == "projects" and assigned_engineer_ids is not None:
                 _replace_project_engineers(item_id, assigned_engineer_ids)
             return jsonify({"data": (updated or record(table, item_id))[0]}), 200
+        except ApprovalConflict as error:
+            return failure("conflict", str(error), 409)
         except ValueError as error:
             return failure("invalid_request", str(error), 400)
         except Exception:
@@ -523,7 +590,7 @@ def item(resource, item_id):
 
 
 @api.post("/uploads")
-@require_user(roles=MANAGERS)
+@require_user()
 def upload():
     uploaded = request.files.get("file")
     if uploaded is None or not uploaded.filename:
@@ -559,8 +626,13 @@ def upload():
         "xls": "application/vnd.ms-excel",
     }[extension]
     related_type, related_id = request.form.get("related_type"), request.form.get("related_id")
+    image_type = request.form.get("image_type")
     if related_type not in {"project", "client", "cleaning_record", "water_testing"} or not related_id:
         return failure("invalid_request", "A valid related_type and related_id are required.", 400)
+    if image_type and (related_type != "project" or image_type not in {"before", "after"}):
+        return failure("invalid_request", "image_type must be before or after for project images.", 400)
+    if g.role == "employee" and (related_type != "project" or extension not in {"png", "jpg", "jpeg"} or image_type not in {"before", "after"}):
+        return failure("forbidden", "Employees may only upload project completion images.", 403)
     try:
         uuid.UUID(related_id)
     except ValueError:
@@ -581,6 +653,7 @@ def upload():
             "organization_id": g.organization_id, "related_type": related_type,
             "related_id": related_id, "original_filename": filename, "storage_path": storage_path,
             "mime_type": content_type, "file_size": len(data), "uploaded_by": g.user.id,
+            "image_type": image_type,
         }).execute().data
         return jsonify({"data": metadata[0]}), 201
     except Exception:
@@ -592,6 +665,198 @@ def upload():
                 current_app.logger.exception("Could not clean up an incomplete document upload.")
         current_app.logger.exception("Document upload failed.")
         return failure("upload_failed", "The document could not be stored.", 503)
+
+
+@api.post("/projects/<project_id>/approve")
+@require_user(roles=APPROVERS)
+def approve_project(project_id):
+    return _decide_completion(project_id, approve=True)
+
+
+@api.post("/projects/<project_id>/reject")
+@require_user(roles=APPROVERS)
+def reject_project(project_id):
+    return _decide_completion(project_id, approve=False)
+
+
+def _decide_completion(project_id, approve):
+    try:
+        uuid.UUID(project_id)
+    except ValueError:
+        return failure("invalid_request", "Project ID must be a valid UUID.", 400)
+    reason = None
+    if not approve:
+        payload = request.get_json(silent=True)
+        reason = payload.get("reason") if isinstance(payload, dict) else None
+        if not isinstance(reason, str) or not reason.strip() or len(reason) > 2000:
+            return failure("invalid_request", "Enter a rejection reason of up to 2000 characters.", 400)
+        reason = reason.strip()
+    try:
+        rows = record("projects", project_id)
+        if not rows:
+            return failure("not_found", "Project not found.", 404)
+        if rows[0].get("approval_status") != "Submitted for Approval":
+            return failure("conflict", "Only completions that are awaiting approval can be approved or rejected.", 409)
+        values = {"status": "Completed", "rejection_reason": None} if approve else {"rejection_reason": reason}
+        updated = _change_approval(rows[0], "Approved" if approve else "Rejected", "Approved" if approve else "Rejected", values, reason)
+        return jsonify({"data": updated[0]})
+    except ApprovalConflict as error:
+        return failure("conflict", str(error), 409)
+    except Exception:
+        current_app.logger.exception("Approval decision failed.")
+        return failure("database_error", "The approval decision could not be saved.", 503)
+
+
+@api.get("/approvals")
+@require_user()
+def list_approvals():
+    status = request.args.get("status", "Submitted for Approval")
+    if status not in APPROVAL_STATUSES:
+        return failure("invalid_request", "Unsupported approval status.", 400)
+    try:
+        rows = scoped_query("projects").eq("approval_status", status).order("updated_at", desc=True).limit(200).execute().data or []
+        return jsonify({"data": rows})
+    except Exception:
+        current_app.logger.exception("Approval list failed.")
+        return failure("database_error", "Approvals are temporarily unavailable.", 503)
+
+
+@api.get("/approval-history")
+@require_user()
+def list_approval_history():
+    project_id = request.args.get("project_id")
+    try:
+        query = db().table("approval_history").select("*").eq("organization_id", g.organization_id)
+        if project_id:
+            try:
+                uuid.UUID(project_id)
+            except ValueError:
+                return failure("invalid_request", "project_id must be a valid record ID.", 400)
+            if not record("projects", project_id):
+                return failure("not_found", "Project not found.", 404)
+            query = query.eq("project_id", project_id)
+        elif g.role == "employee":
+            visible = [row["id"] for row in scoped_query("projects", "id").execute().data or []]
+            if not visible:
+                return jsonify({"data": []})
+            query = query.in_("project_id", visible)
+        rows = query.order("created_at", desc=True).limit(200).execute().data or []
+        return jsonify({"data": rows})
+    except Exception:
+        current_app.logger.exception("Approval history query failed.")
+        return failure("database_error", "Approval history is temporarily unavailable.", 503)
+
+
+@api.get("/dashboard/locations")
+@require_user()
+def dashboard_locations():
+    try:
+        query = scoped_query("projects").is_not("latitude", "null").is_not("longitude", "null")
+        if request.args.get("client_id"):
+            query = query.eq("client_id", request.args["client_id"])
+        rows = query.limit(1000).execute().data or []
+        client_ids = list({row["client_id"] for row in rows if not row.get("client_name") and row.get("client_id")})
+        clients = db().table("clients").select("id,name").eq(
+            "organization_id", g.organization_id
+        ).in_("id", client_ids).execute().data if client_ids else []
+        client_names = {client["id"]: client["name"] for client in clients or []}
+        fields = (
+            "id", "name", "service", "so_no", "engineer_name", "status", "approval_status", "location",
+            "latitude", "longitude", "start_date", "end_date", "visit_time", "system_details", "description",
+            "engineer_visit", "engineer_visit_custom_date",
+        )
+        return jsonify({"data": [
+            {**{field: row.get(field) for field in fields},
+             "client_name": row.get("client_name") or client_names.get(row.get("client_id"))}
+            for row in rows
+        ]})
+    except Exception:
+        current_app.logger.exception("Project location query failed.")
+        return failure("database_error", "Project locations are temporarily unavailable.", 503)
+
+
+@api.delete("/projects/<project_id>/permanent")
+@require_user(roles=EDITORS)
+def permanently_delete_project(project_id):
+    try:
+        uuid.UUID(project_id)
+    except ValueError:
+        return failure("invalid_request", "Project ID must be a valid UUID.", 400)
+
+    try:
+        if not record("projects", project_id):
+            return failure("not_found", "Project not found.", 404)
+        documents = scoped_query("uploaded_documents").eq(
+            "related_type", "project"
+        ).eq("related_id", project_id).execute().data or []
+        upload_root = Path(current_app.config["STORAGE_PATH"]).resolve()
+        paths = []
+        for document in documents:
+            path = (upload_root / document["storage_path"]).resolve()
+            if not path.is_relative_to(upload_root):
+                return failure("storage_error", "A project document has an invalid storage path.", 503)
+            if path.is_file():
+                paths.append(path)
+
+        with tempfile.TemporaryDirectory(dir=upload_root) as quarantine:
+            staged = []
+            try:
+                for index, path in enumerate(paths):
+                    staged_path = Path(quarantine) / str(index)
+                    os.replace(path, staged_path)
+                    staged.append((staged_path, path))
+
+                with sqlalchemy_db.engine.begin() as connection:
+                    connection.execute(
+                        project_tasks.delete().where(
+                            project_tasks.c.organization_id == g.organization_id,
+                            project_tasks.c.project_id == project_id,
+                        )
+                    )
+                    connection.execute(
+                        water_testing_records.update().where(
+                            water_testing_records.c.organization_id == g.organization_id,
+                            water_testing_records.c.project_id == project_id,
+                        ).values(project_id=None)
+                    )
+                    connection.execute(
+                        project_engineers.delete().where(
+                            project_engineers.c.organization_id == g.organization_id,
+                            project_engineers.c.project_id == project_id,
+                        )
+                    )
+                    # Approval history is kept; its reference text still names the deleted project.
+                    connection.execute(
+                        approval_history.update().where(
+                            approval_history.c.organization_id == g.organization_id,
+                            approval_history.c.project_id == project_id,
+                        ).values(project_id=None)
+                    )
+                    connection.execute(
+                        uploaded_documents.delete().where(
+                            uploaded_documents.c.organization_id == g.organization_id,
+                            uploaded_documents.c.related_type == "project",
+                            uploaded_documents.c.related_id == project_id,
+                        )
+                    )
+                    result = connection.execute(
+                        projects.delete().where(
+                            projects.c.organization_id == g.organization_id,
+                            projects.c.id == project_id,
+                        )
+                    )
+                    if result.rowcount != 1:
+                        raise RuntimeError("Project was removed while deletion was in progress.")
+            except Exception:
+                for staged_path, original_path in reversed(staged):
+                    if staged_path.exists():
+                        os.replace(staged_path, original_path)
+                raise
+
+        return jsonify({"message": "Project and its saved documents were permanently deleted."})
+    except Exception:
+        current_app.logger.exception("Permanent project deletion failed.")
+        return failure("database_error", "Project and its saved documents could not be deleted.", 503)
 
 
 def _replace_project_engineers(project_id, engineer_ids):
@@ -611,6 +876,99 @@ def _replace_project_engineers(project_id, engineer_ids):
             }
             for engineer_id in sorted(set(engineer_ids))
         ]).execute()
+
+
+def _resolve_project_client(payload):
+    name = payload.get("client_name")
+    if not isinstance(name, str) or not name.strip():
+        return
+    name = name.strip()
+    clients_found = db().table("clients").select("id").eq(
+        "organization_id", g.organization_id
+    ).eq("name", name).is_("deleted_at", "null").limit(1).execute().data or []
+    if clients_found:
+        payload["client_id"] = clients_found[0]["id"]
+        payload["client_name"] = name
+        return
+    created = db().table("clients").insert({
+        "organization_id": g.organization_id, "name": name, "created_by": g.user.id,
+    }).execute().data
+    if not created:
+        raise ValueError("The project client could not be saved.")
+    payload["client_id"] = created[0]["id"]
+    payload["client_name"] = name
+
+
+def _completion_values(payload):
+    status = payload.get("completion_status")
+    if status not in {"Completed Early", "Completed Within Contract Period", "Completed Late"}:
+        raise ValueError("Choose a valid completion status.")
+    # The project becomes Completed only when an approver approves the submission.
+    payload.pop("status", None)
+    if isinstance(payload.get("invoice_number"), str):
+        payload["invoice_number"] = payload["invoice_number"].strip() or None
+    if status == "Completed Within Contract Period":
+        payload.update({"expected_duration": None, "completed_duration": None, "additional_duration": None})
+    else:
+        expected, completed = payload.get("expected_duration"), payload.get("completed_duration")
+        try:
+            expected, completed = int(expected), int(completed)
+            if expected < 0 or completed < 0:
+                raise ValueError()
+        except (TypeError, ValueError):
+            raise ValueError("Enter valid expected and completed durations in days.")
+        payload["expected_duration"] = expected
+        payload["completed_duration"] = completed
+        payload["additional_duration"] = max(completed - expected, 0)
+    return payload
+
+
+def _engineer_code_taken(payload, engineer_id=None):
+    payload["engineer_code"] = payload["engineer_code"].strip()
+    statement = select(engineers.c.id).where(
+        engineers.c.organization_id == g.organization_id,
+        sqlalchemy_db.func.lower(engineers.c.engineer_code) == payload["engineer_code"].lower(),
+    )
+    if engineer_id:
+        statement = statement.where(engineers.c.id != engineer_id)
+    return sqlalchemy_db.session.execute(statement.limit(1)).first() is not None
+
+
+def _clear_unused_custom_dates(payload):
+    for _, frequency_key, date_key in FREQUENCY_FIELDS:
+        if frequency_key in payload and payload[frequency_key] != "Custom":
+            payload[date_key] = None
+
+
+def _project_reference(project):
+    parts = [project.get("client_name"), project.get("name"), f"SO {project['so_no']}" if project.get("so_no") is not None else None]
+    return " · ".join(str(part) for part in parts if part)[:600] or project["id"]
+
+
+def _change_approval(project, new_status, action, values=None, reason=None):
+    """Move a project to a new approval status and record the change in one transaction."""
+    previous, now = project.get("approval_status"), datetime.now(timezone.utc).isoformat()
+    session = sqlalchemy_db.session
+    try:
+        result = session.execute(projects.update().where(
+            projects.c.organization_id == g.organization_id,
+            projects.c.id == project["id"],
+            projects.c.deleted_at.is_(None),
+            projects.c.approval_status.is_(None) if previous is None else projects.c.approval_status == previous,
+        ).values(**(values or {}), approval_status=new_status, updated_by=g.user.id, updated_at=now))
+        if result.rowcount != 1:
+            raise ApprovalConflict("The approval status changed while you were working. Reload and try again.")
+        session.execute(approval_history.insert().values(
+            id=str(uuid4()), organization_id=g.organization_id, project_id=project["id"],
+            reference=_project_reference({**project, **(values or {})}),
+            previous_status=previous or "Pending", new_status=new_status, action=action, reason=reason,
+            actor_id=g.user.id, actor_name=g.user.full_name or g.user.email, created_at=now,
+        ))
+        session.commit()
+    except Exception:
+        session.rollback()
+        raise
+    return record("projects", project["id"])
 
 
 def _validate_engineer_ids(engineer_ids):
@@ -675,30 +1033,31 @@ def settings():
         payload = request.get_json(silent=True)
         if not isinstance(payload, dict) or set(payload) - {"organization", "user"}:
             return failure("invalid_request", "Provide organization and/or user settings.", 400)
-        response = {}
+        response, now = {}, datetime.now(timezone.utc).isoformat()
         if "organization" in payload:
             if g.role != "administrator":
                 return failure("forbidden", "Only administrators can change organization settings.", 403)
             values = payload["organization"]
-            allowed = {"name", "support_contact", "time_zone", "date_format", "time_format"}
-            if not isinstance(values, dict) or set(values) - allowed:
-                return failure("invalid_request", "Invalid organization settings.", 400)
+            validation = validate_settings("organization", values)
+            if validation:
+                return failure("invalid_request", validation, 400)
             previous = client.table("organization_settings").select("*").eq(
                 "organization_id", g.organization_id
             ).limit(1).execute().data or []
             response["organization"] = client.table("organization_settings").upsert(
-                {"organization_id": g.organization_id, **(previous[0] if previous else {}), **values}, on_conflict="organization_id"
+                {"organization_id": g.organization_id, **(previous[0] if previous else {}), **values, "updated_at": now},
+                on_conflict="organization_id",
             ).execute().data
         if "user" in payload:
             values = payload["user"]
-            allowed = {"appearance", "notification_preferences", "date_format", "time_format", "time_zone"}
-            if not isinstance(values, dict) or set(values) - allowed:
-                return failure("invalid_request", "Invalid user settings.", 400)
+            validation = validate_settings("user", values)
+            if validation:
+                return failure("invalid_request", validation, 400)
             previous = client.table("user_settings").select("*").eq(
                 "organization_id", g.organization_id
             ).eq("user_id", g.user.id).limit(1).execute().data or []
             response["user"] = client.table("user_settings").upsert(
-                {"organization_id": g.organization_id, "user_id": g.user.id, **(previous[0] if previous else {}), **values},
+                {"organization_id": g.organization_id, "user_id": g.user.id, **(previous[0] if previous else {}), **values, "updated_at": now},
                 on_conflict="organization_id,user_id",
             ).execute().data
         return jsonify(response)
@@ -718,12 +1077,17 @@ def download(file_id):
         files = scoped_query("uploaded_documents").eq("id", file_id).limit(1).execute().data or []
         if not files:
             return failure("not_found", "File not found.", 404)
+        if g.role == "employee" and (
+            files[0]["related_type"] != "project" or not record("projects", files[0]["related_id"])
+        ):
+            return failure("not_found", "File not found.", 404)
         upload_root = Path(current_app.config["STORAGE_PATH"]).resolve()
         path = (upload_root / files[0]["storage_path"]).resolve()
         if not path.is_relative_to(upload_root) or not path.is_file():
             return failure("not_found", "File not found.", 404)
         return send_file(
-            path, mimetype=files[0]["mime_type"], as_attachment=True,
+            path, mimetype=files[0]["mime_type"],
+            as_attachment=not (request.args.get("inline") == "1" and files[0]["mime_type"].startswith("image/")),
             download_name=files[0]["original_filename"],
         )
     except Exception:
@@ -749,7 +1113,13 @@ def list_uploads():
                 uuid.UUID(related_id)
             except ValueError:
                 return failure("invalid_request", "related_id must be a valid record ID.", 400)
+            if g.role == "employee" and (
+                related_type != "project" or not record("projects", related_id)
+            ):
+                return failure("not_found", "Related project not found.", 404)
             query = query.eq("related_id", related_id)
+        elif g.role == "employee":
+            return failure("invalid_request", "Employees must request images for one assigned project.", 400)
         files = query.order("created_at", desc=True).limit(200).execute().data or []
         return jsonify({"data": files})
     except Exception:
@@ -758,7 +1128,7 @@ def list_uploads():
 
 
 @api.delete("/uploads/<file_id>")
-@require_user(roles=MANAGERS)
+@require_user(roles=EDITORS)
 def delete_upload(file_id):
     try:
         files = scoped_query("uploaded_documents").eq("id", file_id).limit(1).execute().data or []

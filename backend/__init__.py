@@ -1,3 +1,4 @@
+import json
 import logging
 import os
 import hmac
@@ -8,6 +9,7 @@ from uuid import uuid4
 import click
 from flask import Flask, jsonify, render_template, request, session
 from flask_migrate import Migrate
+from werkzeug.exceptions import HTTPException
 from werkzeug.security import generate_password_hash
 
 from config import Config
@@ -122,6 +124,16 @@ def create_app(config_object=Config):
     @app.errorhandler(413)
     def too_large(_error):
         return jsonify({"error": {"code": "file_too_large", "message": "Upload exceeds 15 MB."}}), 413
+
+    @app.errorhandler(HTTPException)
+    def http_error(error):
+        # Keep Werkzeug's status and headers (such as Allow on 405) but return the API's JSON error shape.
+        response = error.get_response()
+        response.data = json.dumps({"error": {
+            "code": error.name.lower().replace(" ", "_"), "message": error.description,
+        }})
+        response.content_type = "application/json"
+        return response
 
     @app.errorhandler(Exception)
     def unexpected_error(error):

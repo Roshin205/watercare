@@ -1,4 +1,4 @@
-from sqlalchemy import Boolean, Column, Float, ForeignKey, Integer, JSON, String, Table, Text, UniqueConstraint
+from sqlalchemy import Boolean, Column, Float, ForeignKey, Index, Integer, JSON, String, Table, Text, UniqueConstraint
 
 from backend.database import db
 
@@ -82,25 +82,52 @@ clients = business_table(
 engineers = business_table(
     "engineers",
     Column("user_id", String(36), ForeignKey("users.id"), nullable=True, index=True),
+    Column("engineer_code", String(50)),
     Column("full_name", String(255), nullable=False),
     Column("email", String(320)),
     Column("phone", String(60)),
     Column("specialization", String(255)),
     Column("availability", String(255)),
     Column("is_active", Boolean, nullable=False, default=True),
+    Index("uq_engineers_organization_code", "organization_id", "engineer_code", unique=True),
 )
 projects = business_table(
     "projects",
     Column("client_id", String(36), ForeignKey("clients.id"), nullable=False, index=True),
     Column("name", String(255), nullable=False),
+    Column("service", String(40)),
+    Column("client_name", String(255)),
+    Column("so_no", Integer),
+    Column("contract_period", String(10)),
+    Column("system_details", Text),
+    Column("engineer_name", String(255)),
+    Column("engineer_visit", String(20)),
+    Column("engineer_visit_custom_date", String(10)),
+    Column("microbiology", String(3)),
+    Column("microbiology_frequency", String(20)),
+    Column("microbiology_custom_date", String(10)),
+    Column("legionella", String(3)),
+    Column("legionella_frequency", String(20)),
+    Column("legionella_custom_date", String(10)),
     Column("category", String(100)),
     Column("location", Text),
+    Column("latitude", Float),
+    Column("longitude", Float),
     Column("description", Text),
     Column("start_date", String(10)),
     Column("scheduled_date", String(10), index=True),
     Column("scheduled_time", String(16)),
+    Column("end_date", String(10)),
+    Column("visit_time", String(16)),
     Column("status", String(40), nullable=False, default="Planned", index=True),
     Column("notes", Text),
+    Column("completion_status", String(40)),
+    Column("expected_duration", Integer),
+    Column("completed_duration", Integer),
+    Column("additional_duration", Integer),
+    Column("invoice_number", String(100)),
+    Column("approval_status", String(40), default="Pending", index=True),
+    Column("rejection_reason", Text),
 )
 project_engineers = Table(
     "project_engineers", db.metadata,
@@ -165,10 +192,26 @@ uploaded_documents = business_table(
     Column("related_type", String(40), nullable=False),
     Column("related_id", String(36), nullable=False, index=True),
     Column("original_filename", String(255), nullable=False),
+    Column("image_type", String(10)),
     Column("storage_path", Text, nullable=False, unique=True),
     Column("mime_type", String(150), nullable=False),
     Column("file_size", Integer, nullable=False),
     Column("uploaded_by", String(36), ForeignKey("users.id")),
+)
+approval_history = Table(
+    "approval_history", db.metadata,
+    Column("id", String(36), primary_key=True),
+    Column("organization_id", String(36), ForeignKey("organizations.id"), nullable=False, index=True),
+    Column("project_id", String(36), ForeignKey("projects.id"), index=True),
+    Column("task_id", String(36), ForeignKey("project_tasks.id")),
+    Column("reference", String(600), nullable=False),
+    Column("previous_status", String(40), nullable=False),
+    Column("new_status", String(40), nullable=False),
+    Column("action", String(40), nullable=False),
+    Column("reason", Text),
+    Column("actor_id", String(36), ForeignKey("users.id")),
+    Column("actor_name", String(320), nullable=False),
+    Column("created_at", String(40), nullable=False, index=True),
 )
 notifications = business_table(
     "notifications",

@@ -51,6 +51,11 @@ class Query:
             self.filters.append(column.is_(value))
         return self
 
+    def is_not(self, name, value):
+        column = self._column(name)
+        self.filters.append(column.is_not(None) if value == "null" else column.is_not(value))
+        return self
+
     def in_(self, name, values):
         column = self._column(name)
         self.filters.append(column.in_(values) if values else column.is_(None))

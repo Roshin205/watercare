@@ -6,6 +6,7 @@
   <title>WaterCare | Water Testing & Tank Cleaning</title>
   <link rel="preconnect" href="https://fonts.googleapis.com">
   <link href="https://fonts.googleapis.com/css2?family=Amiri:wght@400;700&family=Cairo:wght@400;600;700&display=swap" rel="stylesheet">
+  <link rel="stylesheet" href="https://unpkg.com/leaflet@1.9.4/dist/leaflet.css" integrity="sha256-p4NxAoJBhIIN+hmNHrzRCf9tD/miZyoHS5obTRR9BMY=" crossorigin="">
   <link rel="stylesheet" href="{{ url_for('static', filename='css/app.css') }}">
 </head>
 <body>
@@ -19,19 +20,51 @@
   <div id="app" class="layout hidden">
     <aside class="sidebar"><a class="brand" href="#" data-page="Dashboard"><span class="brand-mark">ماء</span><span><b>WaterCare</b><small>Care in every drop</small></span></a>
       <nav id="navigation">
-        <button data-page="Dashboard" class="active">◈ <span>Dashboard</span></button><button data-page="Projects">▦ <span>Projects</span></button><button data-action="add-project">＋ <span>Add Project</span></button><button data-page="Cleaning Records">⌁ <span>Cleaning Records</span></button><button data-action="add-record">＋ <span>Add Record</span></button><button data-page="Water Testing">◉ <span>Water Testing</span></button><button data-page="Clients">♧ <span>Clients</span></button><button data-page="Engineers">♙ <span>Engineers</span></button><button data-page="Reports">▤ <span>Reports</span></button><button data-page="Settings">⚙ <span>Settings</span></button>
+        <button data-page="Dashboard" class="active">◈ <span>Dashboard</span></button><button data-page="Projects">▦ <span>Projects</span></button><button data-action="add-project">＋ <span>Add Project</span></button><button data-page="Cleaning Records">⌁ <span>Cleaning Records</span></button><button data-action="add-record">＋ <span>Add Record</span></button><button data-page="Water Testing">◉ <span>Water Testing</span></button><button data-page="Clients">♧ <span>Clients</span></button><button data-page="Engineers">♙ <span>Engineers</span></button><button data-page="Approvals">✓ <span>Approvals</span></button><button data-page="Reports">▤ <span>Reports</span></button><button data-page="Settings">⚙ <span>Settings</span></button>
       </nav><div class="side-bottom"><span id="user-email"></span><button id="logout" class="logout">Log out</button></div>
     </aside>
-    <main class="main"><header><div><p class="eyebrow">WATERCARE OPERATIONS</p><h1 id="page-title">Dashboard</h1></div><div class="header-actions"><button id="clients-link" class="outline">Clients</button><select id="client-filter" aria-label="Filter calendar by client"><option value="">All clients</option></select><button id="today" class="outline">Today</button><button id="add-record" class="primary">＋ Add record</button></div></header>
+    <main class="main"><header><div><p class="eyebrow">WATERCARE OPERATIONS</p><h1 id="page-title">Dashboard</h1></div><div class="header-actions"><button id="clients-link" class="outline">Clients</button><select id="client-filter" aria-label="Filter calendar by client"><option value="">All clients</option></select><input id="date-filter" type="date" aria-label="Show work for date"><button id="today" class="outline">Today</button><button id="add-record" class="primary">＋ Add record</button></div></header>
       <section id="notice" class="notice hidden" role="status"></section>
       <section id="dashboard" class="dashboard-grid">
-        <article class="panel overview"><div class="panel-heading"><div><p class="eyebrow">SCHEDULED WORK</p><h2>Project Overview</h2></div><span id="task-position" class="position">0 of 0</span></div><div id="task-card" class="task-card"><p class="empty">Select a date to see scheduled work.</p></div><div class="carousel"><button id="previous-task" aria-label="Previous task">←</button><span id="task-count">No tasks scheduled</span><button id="next-task" aria-label="Next task">→</button></div></article>
+        <article class="panel overview"><div class="panel-heading"><div><p class="eyebrow">SCHEDULED WORK</p><h2>Project Overview</h2></div><span id="task-position" class="position">0 items</span></div><p id="task-count" class="task-count">No tasks scheduled</p><div id="task-list" class="task-list"><p class="empty">Select a date to see scheduled work.</p></div></article>
         <article class="panel calendar-panel"><div class="panel-heading"><button id="previous-month" aria-label="Previous month">←</button><div><p class="eyebrow">SCHEDULE</p><h2 id="month-label"></h2></div><button id="next-month" aria-label="Next month">→</button></div><div class="calendar-grid" id="calendar"></div></article>
+        <article class="panel map-panel"><div class="panel-heading"><div><p class="eyebrow">SITE LOCATIONS</p><h2>Project Map</h2></div><span id="map-count" class="position">0 located projects</span></div><div id="project-map" class="project-map" role="region" aria-label="Map of project locations"></div><p id="map-message" class="muted map-message"></p></article>
+      </section>
+      <section id="approvals" class="hidden">
+        <article class="panel"><div class="panel-heading"><div><p class="eyebrow">COMPLETION REVIEW</p><h2>Awaiting Approval</h2></div><span id="approval-count" class="position"></span></div><div class="table-wrap"><table><thead><tr><th>Client</th><th>Project</th><th>Engineer</th><th>Completion</th><th>Invoice No.</th><th>Actions</th></tr></thead><tbody id="approval-body"></tbody></table></div></article>
+        <article class="panel history-panel"><div class="panel-heading"><div><p class="eyebrow">AUDIT TRAIL</p><h2>Approval History</h2></div></div><div class="table-wrap"><table><thead><tr><th>Date &amp; time</th><th>Task / project</th><th>Status change</th><th>Action</th><th>By</th><th>Rejection reason</th></tr></thead><tbody id="history-body"></tbody></table></div></article>
       </section>
       <section id="records" class="panel hidden"><div class="panel-heading"><div><p class="eyebrow">BUSINESS RECORDS</p><h2 id="records-title"></h2></div><input id="search" placeholder="Search records…" aria-label="Search records"></div><div class="table-wrap"><table><thead id="table-head"></thead><tbody id="table-body"></tbody></table></div></section>
     </main>
   </div>
   <dialog id="record-dialog"><form id="record-form"><div class="panel-heading"><h2 id="form-title">Add record</h2><button type="button" id="close-dialog" class="icon-button" aria-label="Close">×</button></div><div id="form-fields" class="form-grid"></div><p id="form-message" role="alert"></p><button class="primary">Save record</button></form></dialog>
+  <dialog id="completion-dialog"><form id="completion-form">
+    <div class="panel-heading"><h2 id="completion-title">Mark Project as Completed</h2><button type="button" id="close-completion-dialog" class="icon-button" aria-label="Close">×</button></div>
+    <input id="completion-project-id" type="hidden">
+    <label>Completion Status<select id="completion-status" required><option value="">Choose status</option><option>Completed Early</option><option>Completed Within Contract Period</option><option>Completed Late</option></select></label>
+    <div id="completion-duration-fields" class="form-grid hidden">
+      <label>Expected Duration (days)<input id="expected-duration" type="number" min="0" step="1"></label>
+      <label>Completed Duration (days)<input id="completed-duration" type="number" min="0" step="1"></label>
+    </div>
+    <p id="additional-duration" role="status"></p>
+    <label>Invoice Number<input id="invoice-number" maxlength="100" autocomplete="off"></label>
+    <div id="completion-approval" class="approval-summary hidden"></div>
+    <div id="completion-image-inputs" class="form-grid">
+      <label class="wide">Before Images<input id="before-images" type="file" accept="image/png,image/jpeg" multiple required></label>
+      <label class="wide">After Images<input id="after-images" type="file" accept="image/png,image/jpeg" multiple required></label>
+    </div>
+    <div id="saved-project-images" class="project-images"></div>
+    <div id="completion-history" class="completion-history"></div>
+    <p id="completion-message" role="alert"></p><button id="completion-submit" class="primary">Submit for Approval</button>
+  </form></dialog>
+  <dialog id="reject-dialog"><form id="reject-form">
+    <div class="panel-heading"><h2>Reject Completion</h2><button type="button" id="close-reject-dialog" class="icon-button" aria-label="Close">×</button></div>
+    <p id="reject-reference" class="muted"></p>
+    <label class="reject-label">Rejection reason<textarea id="reject-reason" maxlength="2000" required></textarea></label>
+    <p id="reject-message" role="alert"></p><button class="primary">Reject Completion</button>
+  </form></dialog>
+  <script src="https://unpkg.com/leaflet@1.9.4/dist/leaflet.js" integrity="sha256-20nQCchB9co0qIjJZRGuk2/Z9VM+kNiyxNV1lvTlZBo=" crossorigin="" defer></script>
+  <script src="{{ url_for('static', filename='js/json-fields.js') }}" defer></script>
   <script src="{{ url_for('static', filename='js/app.js') }}" defer></script>
 </body>
 </html>
