@@ -8,71 +8,41 @@
     Clients: { path: "clients", fields: ["name", "organization_name", "contact_person", "phone", "email", "address", "category", "notes"], columns: ["name", "contact_person", "phone", "email"] },
     Engineers: { path: "engineers", fields: ["full_name", "email", "phone", "specialization", "availability"], columns: ["full_name", "specialization", "email", "phone"] }
   };
-  let token = sessionStorage.getItem("watercare_token");
+  let csrfToken = "";
   let page = "Dashboard", selectedDate = new Date(), month = new Date();
   let tasks = [], taskIndex = 0, records = [], clients = [], engineers = [], editingId = null, currentRole = "";
 
   async function request(path, options = {}) {
     const headers = new Headers(options.headers || {});
-    if (token) headers.set("Authorization", `Bearer ${token}`);
+    if (csrfToken && !["GET", "HEAD", "OPTIONS"].includes((options.method || "GET").toUpperCase())) headers.set("X-CSRF-Token", csrfToken);
     if (options.body && !(options.body instanceof FormData)) headers.set("Content-Type", "application/json");
-    const response = await fetch(`${api}${path}`, { ...options, headers });
-    if (response.status === 401 && sessionStorage.getItem("watercare_refresh_token")) {
-      await refreshSession();
-      headers.set("Authorization", `Bearer ${token}`);
-      const retry = await fetch(`${api}${path}`, { ...options, headers });
-      const retryBody = retry.headers.get("content-type")?.includes("json") ? await retry.json() : null;
-      if (!retry.ok) throw new Error(retryBody?.error?.message || `Request failed (${retry.status}).`);
-      return retryBody;
-    }
+    const response = await fetch(`${api}${path}`, { ...options, headers, credentials: "same-origin" });
     const body = response.headers.get("content-type")?.includes("json") ? await response.json() : null;
     if (!response.ok) throw new Error(body?.error?.message || `Request failed (${response.status}).`);
     return body;
-  }
-  async function refreshSession() {
-    const response = await fetch(`${window.WATERCARE_SUPABASE_URL}/auth/v1/token?grant_type=refresh_token`, {
-      method: "POST",
-      headers: { "Content-Type": "application/json", apikey: window.WATERCARE_SUPABASE_ANON_KEY },
-      body: JSON.stringify({ refresh_token: sessionStorage.getItem("watercare_refresh_token") })
-    });
-    const refreshed = await response.json();
-    if (!response.ok || !refreshed.access_token) {
-      sessionStorage.removeItem("watercare_token");
-      sessionStorage.removeItem("watercare_refresh_token");
-      throw new Error("Your session has expired. Please sign in again.");
-    }
-    token = refreshed.access_token;
-    sessionStorage.setItem("watercare_token", token);
-    sessionStorage.setItem("watercare_refresh_token", refreshed.refresh_token);
   }
   function showError(message) {
     const notice = $("#notice"); notice.textContent = message; notice.classList.remove("hidden"); notice.classList.add("error");
   }
   function hideError() { $("#notice").classList.add("hidden"); $("#notice").classList.remove("error"); }
   async function signIn(email, password) {
-    const response = await fetch(`${window.WATERCARE_SUPABASE_URL || ""}/auth/v1/token?grant_type=password`, {
-      method: "POST", headers: { "Content-Type": "application/json", apikey: window.WATERCARE_SUPABASE_ANON_KEY || "" },
-      body: JSON.stringify({ email, password })
-    });
-    const result = await response.json();
-    if (!response.ok || !result.access_token) throw new Error(result.msg || result.message || "Unable to sign in.");
-    token = result.access_token;
-    sessionStorage.setItem("watercare_token", token);
-    sessionStorage.setItem("watercare_refresh_token", result.refresh_token);
+    const result = await request("/auth/login", { method: "POST", body: JSON.stringify({ email, password }) });
+    csrfToken = result.csrf_token;
     await initialize();
   }
   async function initialize() {
     try {
       const current = await request("/auth/me");
+      csrfToken = current.csrf_token || csrfToken;
       $("#login").classList.add("hidden"); $("#app").classList.remove("hidden");
       currentRole = current.role;
       document.querySelectorAll("[data-action]").forEach(button => {
         button.classList.toggle("hidden", !["administrator", "manager"].includes(currentRole));
       });
-      $("#user-email").textContent = `${current.user.email || "Employee"} · ${current.role}`;
+      $("#user-email").textContent = `${current.user.email || "Employee"} | ${current.role}`;
       await loadClients(); navigate("Dashboard");
     } catch (error) {
-      token = null; sessionStorage.removeItem("watercare_token");
+      csrfToken = "";
       $("#app").classList.add("hidden"); $("#login").classList.remove("hidden");
       $("#login-message").textContent = error.message;
     }
@@ -226,27 +196,12 @@
     try { await signIn(values.get("email"), values.get("password")); }
     catch (error) { $("#login-message").textContent = error.message; }
   });
-  $("#forgot").onclick = async () => {
-    const email = $("#login-form").elements.email.value;
-    if (!email) { $("#login-message").textContent = "Enter your email address first."; return; }
-    try {
-      const response = await fetch(`${window.WATERCARE_SUPABASE_URL || ""}/auth/v1/recover`, { method: "POST", headers: { "Content-Type": "application/json", apikey: window.WATERCARE_SUPABASE_ANON_KEY || "" }, body: JSON.stringify({ email }) });
-      if (!response.ok) throw new Error("Password reset could not be requested.");
-      $("#login-message").textContent = "If the account exists, password reset instructions have been sent.";
-    } catch (error) { $("#login-message").textContent = error.message; }
+  $("#forgot").onclick = () => {
+    $("#login-message").textContent = "Contact your WaterCare administrator to reset your password.";
   };
   $("#logout").onclick = async () => {
-    try {
-      await fetch(`${window.WATERCARE_SUPABASE_URL}/auth/v1/logout`, {
-        method: "POST",
-        headers: { apikey: window.WATERCARE_SUPABASE_ANON_KEY, Authorization: `Bearer ${token}` }
-      });
-    } finally {
-      token = null;
-      sessionStorage.removeItem("watercare_token");
-      sessionStorage.removeItem("watercare_refresh_token");
-      location.reload();
-    }
+    try { await request("/auth/logout", { method: "POST" }); }
+    finally { csrfToken = ""; location.reload(); }
   };
   $("#navigation").onclick = event => {
     const action = event.target.closest("[data-action]");
@@ -290,12 +245,12 @@
     if (report) {
       event.preventDefault();
       try {
-        const response = await fetch(report.href, { headers: { Authorization: `Bearer ${token}` } });
+        const response = await fetch(report.href, { credentials: "same-origin" });
         if (!response.ok) throw new Error("Report export failed.");
         const blob = await response.blob(), link = document.createElement("a");
         link.href = URL.createObjectURL(blob); link.download = `watercare-${report.dataset.report}-report.${report.dataset.format}`; link.click(); URL.revokeObjectURL(link.href);
       } catch (error) { showError(error.message); }
     }
   };
-  if (token) initialize();
+  initialize();
 })();

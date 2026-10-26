@@ -1,180 +1,205 @@
-from types import SimpleNamespace
+from datetime import datetime, timezone
+from io import BytesIO
+from uuid import uuid4
 
 import pytest
+from werkzeug.security import generate_password_hash
 
 from backend import create_app
+from backend.database import db
+from backend.models import memberships, organizations, users
 from backend.routes.api import safe_spreadsheet_value
-from supabase import create_client
-from supabase.lib.client_options import SyncClientOptions
 from backend.utils.validators import validate_payload
-
-
-class FakeQuery:
-    def __init__(self, table, role):
-        self.table_name = table
-        self.role = role
-
-    def select(self, *_args):
-        return self
-
-    def eq(self, *_args):
-        return self
-
-    def limit(self, *_args):
-        return self
-
-    def execute(self):
-        data = [{
-            "organization_id": "org-1", "role": self.role, "status": "active",
-        }] if self.table_name == "organization_memberships" else []
-        return SimpleNamespace(data=data)
-
-
-class FakeClient:
-    def __init__(self, role="administrator"):
-        self.role = role
-        self.auth = SimpleNamespace(get_user=lambda _token: SimpleNamespace(
-            user=SimpleNamespace(id="user-1", email="employee@example.test")
-        ))
-
-    def table(self, table):
-        return FakeQuery(table, self.role)
 
 
 class TestConfig:
     TESTING = True
-    SECRET_KEY = "test-only"
-    SUPABASE_URL = ""
-    SUPABASE_ANON_KEY = ""
-    SUPABASE_SERVICE_ROLE_KEY = ""
+    SECRET_KEY = "test-secret-key"
+    SQLALCHEMY_DATABASE_URI = "sqlite://"
+    SQLALCHEMY_TRACK_MODIFICATIONS = False
+    STORAGE_PATH = "test-uploads"
 
 
-def make_client():
-    return create_app(TestConfig, FakeClient()).test_client()
+@pytest.fixture
+def app():
+    application = create_app(TestConfig)
+    with application.app_context():
+        db.create_all()
+        now = datetime.now(timezone.utc).isoformat()
+        db.session.execute(organizations.insert().values(
+            id="org-1", name="Test organization", created_at=now, updated_at=now,
+        ))
+        db.session.execute(users.insert().values(
+            id="user-1", email="admin@example.test", full_name="Admin",
+            password_hash=generate_password_hash("secure-test-password"),
+            is_active=True, created_at=now, updated_at=now,
+        ))
+        db.session.execute(memberships.insert().values(
+            id=str(uuid4()), organization_id="org-1", user_id="user-1",
+            role="administrator", status="active", created_at=now,
+        ))
+        db.session.commit()
+        yield application
+        db.drop_all()
 
 
-def test_health_reports_missing_supabase_configuration():
-    response = create_app(TestConfig).test_client().get("/api/health")
-    assert response.status_code == 503
-    assert response.json["status"] == "setup_required"
-
-
-def test_health_checks_database_when_configured():
-    response = make_client().get("/api/health")
+@pytest.fixture
+def client(app):
+    test_client = app.test_client()
+    response = test_client.post("/api/auth/login", json={
+        "email": "admin@example.test", "password": "secure-test-password",
+    })
     assert response.status_code == 200
-    assert response.json["status"] == "ok"
+    test_client.csrf_token = response.json["csrf_token"]
+    return test_client
 
 
-def test_missing_production_credentials_fail_startup_with_variable_names():
+def csrf(client):
+    return {"X-CSRF-Token": client.csrf_token}
+
+
+def test_health_checks_database(app):
+    assert app.test_client().get("/api/health").json == {"status": "ok"}
+
+
+def test_production_requires_environment_configuration(monkeypatch):
     class MissingConfig:
+        TESTING = False
         SECRET_KEY = ""
-        SUPABASE_URL = ""
-        SUPABASE_ANON_KEY = ""
-        SUPABASE_SERVICE_ROLE_KEY = ""
+        SQLALCHEMY_DATABASE_URI = "sqlite://"
+        STORAGE_PATH = "test-uploads"
 
-    with pytest.raises(RuntimeError, match="SUPABASE_URL") as error:
+    monkeypatch.setenv("FLASK_ENV", "production")
+    monkeypatch.delenv("SECRET_KEY", raising=False)
+    monkeypatch.delenv("DATABASE_URL", raising=False)
+    with pytest.raises(RuntimeError, match="SECRET_KEY, DATABASE_URL"):
         create_app(MissingConfig)
-    assert "SUPABASE_SERVICE_ROLE_KEY" in str(error.value)
-    assert "secret-value" not in str(error.value)
+    monkeypatch.delenv("FLASK_ENV")
 
 
-def test_api_requires_bearer_token():
-    response = make_client().get("/api/auth/me")
+def test_login_logout_and_password_session(client):
+    assert client.get("/api/auth/me").json["role"] == "administrator"
+    response = client.post("/api/auth/logout", headers=csrf(client))
+    assert response.status_code == 200
+    assert client.get("/api/auth/me").status_code == 401
+
+
+def test_wrong_password_is_rejected(app):
+    response = app.test_client().post("/api/auth/login", json={
+        "email": "admin@example.test", "password": "incorrect",
+    })
     assert response.status_code == 401
-    assert response.json["error"]["code"] == "unauthorized"
 
 
-def test_authenticated_identity_includes_org_membership():
-    response = make_client().get("/api/auth/me", headers={"Authorization": "Bearer valid"})
+def test_authenticated_user_can_create_and_read_client(client):
+    response = client.post("/api/clients", headers=csrf(client), json={"name": "Acme"})
+    assert response.status_code == 201
+    item_id = response.json["data"]["id"]
+    assert client.get(f"/api/clients/{item_id}").json["data"]["name"] == "Acme"
+
+
+def test_administrator_can_create_an_employee_account(client):
+    response = client.post("/api/auth/users", headers=csrf(client), json={
+        "email": "new@example.test", "full_name": "New Employee",
+        "password": "a-long-test-password", "role": "employee",
+    })
+    assert response.status_code == 201
+    employee = client.application.test_client()
+    login_response = employee.post("/api/auth/login", json={
+        "email": "new@example.test", "password": "a-long-test-password",
+    })
+    assert login_response.status_code == 200
+    assert login_response.json["role"] == "employee"
+    engineers_response = client.get("/api/engineers")
+    assert any(engineer["user_id"] == response.json["data"]["id"] for engineer in engineers_response.json["data"])
+
+
+def test_csrf_and_authentication_are_required(app):
+    anonymous = app.test_client()
+    assert anonymous.get("/api/clients").status_code == 401
+    assert anonymous.post("/api/clients", json={"name": "Acme"}).status_code == 401
+    client = app.test_client()
+    client.post("/api/auth/login", json={"email": "admin@example.test", "password": "secure-test-password"})
+    assert client.post("/api/clients", json={"name": "Acme"}).status_code == 403
+
+
+def test_employee_cannot_create_client(app):
+    with app.app_context():
+        now = datetime.now(timezone.utc).isoformat()
+        db.session.execute(users.insert().values(
+            id="employee-1", email="employee@example.test", full_name="Employee",
+            password_hash=generate_password_hash("secure-test-password"),
+            is_active=True, created_at=now, updated_at=now,
+        ))
+        db.session.execute(memberships.insert().values(
+            id=str(uuid4()), organization_id="org-1", user_id="employee-1",
+            role="employee", status="active", created_at=now,
+        ))
+        db.session.commit()
+    client = app.test_client()
+    response = client.post("/api/auth/login", json={
+        "email": "employee@example.test", "password": "secure-test-password",
+    })
     assert response.status_code == 200
-    assert response.json["organization_id"] == "org-1"
-    assert response.json["role"] == "administrator"
+    assert client.post("/api/clients", headers={"X-CSRF-Token": response.json["csrf_token"]}, json={"name": "Blocked"}).status_code == 403
 
 
-def test_authenticated_database_client_receives_user_token(monkeypatch):
-    import backend.security.authentication as auth_module
+def test_user_cannot_access_records_from_another_organization(client):
+    with client.session_transaction() as browser_session:
+        browser_session["organization_id"] = "another-org"
+    assert client.get("/api/clients").status_code == 401
 
-    class AuthenticatedConfig(TestConfig):
-        SUPABASE_URL = "https://supabase.example"
-        SUPABASE_ANON_KEY = "public-anon-key"
-        SUPABASE_SERVICE_ROLE_KEY = "server-secret"
 
-    fake = FakeClient()
-    calls = []
-
-    def create_authenticated_client(url, key, options):
-        calls.append((url, key, options.headers))
-        return fake
-
-    monkeypatch.setattr(auth_module, "create_client", create_authenticated_client)
-    response = create_app(AuthenticatedConfig, FakeClient()).test_client().get(
-        "/api/auth/me", headers={"Authorization": "Bearer user-access-token"}
+def test_private_document_upload_download_and_delete(client):
+    created = client.post("/api/clients", headers=csrf(client), json={"name": "Document client"})
+    client_id = created.json["data"]["id"]
+    upload = client.post(
+        "/api/uploads",
+        headers=csrf(client),
+        data={
+            "related_type": "client",
+            "related_id": client_id,
+            "file": (BytesIO(b"%PDF-1.4\nWaterCare test\n%%EOF"), "result.pdf", "application/pdf"),
+        },
+        content_type="multipart/form-data",
     )
-    assert response.status_code == 200
-    assert calls == [(
-        "https://supabase.example",
-        "public-anon-key",
-        {"Authorization": "Bearer user-access-token"},
-    )]
+    assert upload.status_code == 201
+    file_id = upload.json["data"]["id"]
+    download = client.get(f"/api/uploads/{file_id}")
+    assert download.status_code == 200
+    assert download.data.startswith(b"%PDF-")
+    download.close()
+    assert client.delete(f"/api/uploads/{file_id}", headers=csrf(client)).status_code == 200
+    assert client.get(f"/api/uploads/{file_id}").status_code == 404
 
 
-def test_supabase_sdk_builds_request_with_user_bearer_header():
-    client = create_client(
-        "https://example.supabase.co",
-        "public-anon-key",
-        SyncClientOptions(headers={"Authorization": "Bearer employee-token"}),
-    )
-    try:
-        assert client.postgrest.session.headers["Authorization"] == "Bearer employee-token"
-    finally:
-        client.postgrest.session.close()
-        client.storage.session.close()
-        client.auth.close()
-
-
-def test_non_member_cannot_select_another_organization():
-    response = make_client().get("/api/auth/me", headers={
-        "Authorization": "Bearer valid", "X-Organization-ID": "org-2",
-    })
-    assert response.status_code == 403
-
-
-def test_employee_cannot_create_client():
-    client = create_app(TestConfig, FakeClient(role="employee")).test_client()
-    response = client.post("/api/clients", headers={"Authorization": "Bearer valid"}, json={"name": "Blocked"})
-    assert response.status_code == 403
-
-
-def test_invalid_payloads_are_rejected_server_side():
-    assert "name" in validate_payload("clients", {})
-    assert "status" in validate_payload("projects", {
-        "name": "Test", "client_id": "ed02a8d3-b4bd-4d24-9152-bba33b14702b", "status": "Unknown",
-    })
-    assert validate_payload("clients", {"name": "WaterCare"}) is None
-
-
-def test_unknown_fields_are_rejected():
-    assert "Unsupported field" in validate_payload("clients", {
-        "name": "Client", "organization_id": "attacker-controlled",
-    })
-
-
-def test_calendar_rejects_malformed_dates():
-    response = make_client().get(
-        "/api/dashboard/tasks?from=20261023&to=2026-10-24",
-        headers={"Authorization": "Bearer valid"},
-    )
+def test_calendar_rejects_malformed_dates(client):
+    response = client.get("/api/dashboard/tasks?from=20261023&to=2026-10-24")
     assert response.status_code == 400
 
 
-def test_login_shell_is_served_without_secret_values():
-    response = create_app(TestConfig).test_client().get("/")
+def test_settings_are_saved_with_organization_and_user_scope(client):
+    response = client.patch("/api/settings", headers=csrf(client), json={
+        "organization": {"name": "Updated organization"},
+        "user": {"appearance": "dark", "time_zone": "UTC"},
+    })
+    assert response.status_code == 200
+    saved = client.get("/api/settings").json
+    assert saved["organization"]["name"] == "Updated organization"
+    assert saved["user"]["appearance"] == "dark"
+
+
+def test_login_shell_preserves_watercare_brand_and_has_no_provider_globals(app):
+    response = app.test_client().get("/")
     assert response.status_code == 200
     assert b"WaterCare" in response.data
-    assert b"service_role" not in response.data
+    assert b"window.WATERCARE_" not in response.data
 
 
-def test_exports_neutralize_spreadsheet_formulas():
+def test_payload_validation_and_spreadsheet_safety():
+    assert "name" in validate_payload("clients", {})
+    assert validate_payload("clients", {"name": "WaterCare"}) is None
+    assert "Unsupported field" in validate_payload("clients", {"name": "Client", "organization_id": "attacker"})
     assert safe_spreadsheet_value("=1+1") == "'=1+1"
     assert safe_spreadsheet_value("-2") == "'-2"
     assert safe_spreadsheet_value(2) == 2

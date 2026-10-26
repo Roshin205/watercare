@@ -1,13 +1,21 @@
 import csv
 import io
 import re
+import secrets
 import uuid
 import zipfile
 from datetime import date, datetime, timezone
+from pathlib import Path
+from uuid import uuid4
 
-from flask import Blueprint, current_app, g, jsonify, request, send_file
+from flask import Blueprint, current_app, g, jsonify, request, send_file, session
+from sqlalchemy import select
+from werkzeug.security import generate_password_hash
+from werkzeug.utils import secure_filename
 
-from backend.security.authentication import require_user
+from backend.database import db as sqlalchemy_db
+from backend.models import engineers, memberships, users
+from backend.security.authentication import login, require_user
 from backend.utils.validators import RESOURCE_FIELDS, validate_payload
 
 api = Blueprint("api", __name__)
@@ -24,10 +32,7 @@ RESOURCES = {
 
 
 def db():
-    client = getattr(g, "supabase", None)
-    if client is None:
-        raise RuntimeError("An authenticated Supabase session is required.")
-    return client
+    return current_app.extensions["watercare_database"]
 
 
 def failure(code, message, status):
@@ -90,11 +95,111 @@ def record(table, item_id):
 @api.get("/auth/me")
 @require_user()
 def me():
+    if not session.get("csrf_token"):
+        session["csrf_token"] = secrets.token_urlsafe(32)
     return jsonify({
         "user": {"id": g.user.id, "email": getattr(g.user, "email", None)},
         "organization_id": g.organization_id,
         "role": g.role,
+        "csrf_token": session["csrf_token"],
     })
+
+
+@api.post("/auth/login")
+def login_route():
+    payload = request.get_json(silent=True)
+    if not isinstance(payload, dict) or not isinstance(payload.get("email"), str) or not isinstance(payload.get("password"), str):
+        return failure("invalid_request", "Email and password are required.", 400)
+    account = login(payload["email"].strip(), payload["password"])
+    if not account:
+        return failure("unauthorized", "Email or password is incorrect, or the account has no single active organization.", 401)
+    user, membership = account
+    session.clear()
+    session.permanent = True
+    session["user_id"] = user["id"]
+    session["organization_id"] = membership.organization_id
+    session["csrf_token"] = secrets.token_urlsafe(32)
+    return jsonify({
+        "user": {"id": user["id"], "email": user["email"]},
+        "organization_id": membership.organization_id,
+        "role": membership.role,
+        "csrf_token": session["csrf_token"],
+    })
+
+
+@api.post("/auth/logout")
+def logout_route():
+    session.clear()
+    return jsonify({"message": "Signed out."})
+
+
+@api.post("/auth/users")
+@require_user(roles=ADMIN)
+def create_user():
+    payload = request.get_json(silent=True)
+    if not isinstance(payload, dict) or set(payload) - {"email", "full_name", "password", "role"}:
+        return failure("invalid_request", "Provide email, full_name, password, and role.", 400)
+    email = payload.get("email")
+    full_name = payload.get("full_name")
+    password = payload.get("password")
+    role = payload.get("role", "employee")
+    if (
+        not isinstance(email, str) or len(email) > 320 or not re.fullmatch(r"[^@\s]+@[^@\s]+\.[^@\s]+", email)
+        or not isinstance(full_name, str) or not full_name.strip() or len(full_name) > 255
+        or not isinstance(password, str) or not 12 <= len(password) <= 512
+        or role not in {"manager", "employee"}
+    ):
+        return failure("invalid_request", "Use a valid email, name, role, and password of at least 12 characters.", 400)
+    existing = sqlalchemy_db.session.execute(select(users.c.id).where(users.c.email == email.lower())).first()
+    if existing:
+        return failure("conflict", "An account with this email already exists.", 409)
+    user_id, now = str(uuid4()), datetime.now(timezone.utc).isoformat()
+    try:
+        sqlalchemy_db.session.execute(users.insert().values(
+            id=user_id, email=email.lower(), full_name=full_name.strip(),
+            password_hash=generate_password_hash(password), is_active=True,
+            created_at=now, updated_at=now,
+        ))
+        sqlalchemy_db.session.execute(memberships.insert().values(
+            id=str(uuid4()), organization_id=g.organization_id, user_id=user_id,
+            role=role, status="active", created_at=now,
+        ))
+        sqlalchemy_db.session.execute(engineers.insert().values(
+            id=str(uuid4()), organization_id=g.organization_id, user_id=user_id,
+            full_name=full_name.strip(), email=email.lower(), is_active=True,
+            created_by=g.user.id, updated_by=g.user.id, created_at=now, updated_at=now,
+        ))
+        sqlalchemy_db.session.commit()
+        return jsonify({"data": {"id": user_id, "email": email.lower(), "full_name": full_name.strip(), "role": role}}), 201
+    except Exception:
+        sqlalchemy_db.session.rollback()
+        current_app.logger.exception("Employee account creation failed.")
+        return failure("database_error", "Employee account could not be created.", 503)
+
+
+@api.post("/auth/change-password")
+@require_user()
+def change_password():
+    payload = request.get_json(silent=True)
+    if (
+        not isinstance(payload, dict)
+        or not isinstance(payload.get("current_password"), str)
+        or not isinstance(payload.get("new_password"), str)
+        or not 12 <= len(payload["new_password"]) <= 512
+    ):
+        return failure("invalid_request", "Provide your current password and a new password between 12 and 512 characters.", 400)
+    account = sqlalchemy_db.session.execute(select(users).where(users.c.id == g.user.id)).mappings().first()
+    from werkzeug.security import check_password_hash
+
+    if not account or not check_password_hash(account["password_hash"], payload["current_password"]):
+        return failure("unauthorized", "Current password is incorrect.", 401)
+    sqlalchemy_db.session.execute(users.update().where(users.c.id == g.user.id).values(
+        password_hash=generate_password_hash(payload["new_password"]),
+        updated_at=datetime.now(timezone.utc).isoformat(),
+    ))
+    sqlalchemy_db.session.commit()
+    session.clear()
+    return jsonify({"message": "Password changed. Sign in again."})
 
 
 @api.get("/dashboard/summary")
@@ -465,9 +570,13 @@ def upload():
     try:
         if not record(table, related_id):
             return failure("not_found", "Related record not found.", 404)
-        storage_path = f"{g.organization_id}/{related_type}/{related_id}/{uuid.uuid4().hex}-{filename}"
-        bucket = current_app.config["STORAGE_BUCKET"]
-        db().storage.from_(bucket).upload(storage_path, data, {"content-type": content_type, "upsert": "false"})
+        storage_path = f"{g.organization_id}/{related_type}/{related_id}/{uuid.uuid4().hex}-{secure_filename(filename)}"
+        upload_root = Path(current_app.config["STORAGE_PATH"]).resolve()
+        destination = (upload_root / storage_path).resolve()
+        if not destination.is_relative_to(upload_root):
+            return failure("invalid_request", "Invalid upload destination.", 400)
+        destination.parent.mkdir(parents=True, exist_ok=True)
+        destination.write_bytes(data)
         metadata = db().table("uploaded_documents").insert({
             "organization_id": g.organization_id, "related_type": related_type,
             "related_id": related_id, "original_filename": filename, "storage_path": storage_path,
@@ -477,7 +586,8 @@ def upload():
     except Exception:
         if storage_path:
             try:
-                db().storage.from_(current_app.config["STORAGE_BUCKET"]).remove([storage_path])
+                upload_root = Path(current_app.config["STORAGE_PATH"]).resolve()
+                (upload_root / storage_path).resolve().unlink(missing_ok=True)
             except Exception:
                 current_app.logger.exception("Could not clean up an incomplete document upload.")
         current_app.logger.exception("Document upload failed.")
@@ -526,7 +636,8 @@ def _validate_relationships(resource, payload):
         item_id = payload.get(field)
         if not item_id:
             continue
-        query = db().table(table).select("id,client_id").eq(
+        selected_fields = "id,client_id" if "client_id" in db().table(table).table.c else "id"
+        query = db().table(table).select(selected_fields).eq(
             "organization_id", g.organization_id
         ).eq("id", item_id).is_("deleted_at", "null")
         if table == "engineers":
@@ -607,10 +718,14 @@ def download(file_id):
         files = scoped_query("uploaded_documents").eq("id", file_id).limit(1).execute().data or []
         if not files:
             return failure("not_found", "File not found.", 404)
-        signed = db().storage.from_(current_app.config["STORAGE_BUCKET"]).create_signed_url(
-            files[0]["storage_path"], 60
+        upload_root = Path(current_app.config["STORAGE_PATH"]).resolve()
+        path = (upload_root / files[0]["storage_path"]).resolve()
+        if not path.is_relative_to(upload_root) or not path.is_file():
+            return failure("not_found", "File not found.", 404)
+        return send_file(
+            path, mimetype=files[0]["mime_type"], as_attachment=True,
+            download_name=files[0]["original_filename"],
         )
-        return jsonify({"url": signed.get("signedURL") or signed.get("signedUrl"), "expires_in": 60})
     except Exception:
         current_app.logger.exception("Signed download URL creation failed.")
         return failure("storage_error", "The document is temporarily unavailable.", 503)
@@ -650,7 +765,11 @@ def delete_upload(file_id):
         if not files:
             return failure("not_found", "File not found.", 404)
         file_row = files[0]
-        db().storage.from_(current_app.config["STORAGE_BUCKET"]).remove([file_row["storage_path"]])
+        upload_root = Path(current_app.config["STORAGE_PATH"]).resolve()
+        path = (upload_root / file_row["storage_path"]).resolve()
+        if not path.is_relative_to(upload_root):
+            return failure("not_found", "File not found.", 404)
+        path.unlink(missing_ok=True)
         db().table("uploaded_documents").update({
             "deleted_at": datetime.now(timezone.utc).isoformat(), "updated_by": g.user.id,
         }).eq("organization_id", g.organization_id).eq("id", file_id).execute()

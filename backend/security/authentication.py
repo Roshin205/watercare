@@ -1,71 +1,61 @@
 from functools import wraps
+from types import SimpleNamespace
 
-from flask import current_app, g, jsonify, request
-from supabase import create_client
-from supabase.lib.client_options import SyncClientOptions
+from flask import current_app, g, jsonify, request, session
+from sqlalchemy import select
+from werkzeug.security import check_password_hash
+
+from backend.database import db
+from backend.models import memberships, users
 
 
 def require_user(roles=None):
-    def decorator(handler):
-        @wraps(handler)
+    def decorate(view):
+        @wraps(view)
         def wrapped(*args, **kwargs):
-            client = current_app.extensions.get("supabase")
-            if client is None:
-                return jsonify({"error": {"code": "service_unavailable", "message": "Authentication service is not configured."}}), 503
-            authorization = request.headers.get("Authorization", "")
-            if not authorization.startswith("Bearer "):
+            if request.endpoint == "api.login" and request.method == "POST":
+                return view(*args, **kwargs)
+            user_id, organization_id = session.get("user_id"), session.get("organization_id")
+            if not user_id or not organization_id:
                 return jsonify({"error": {"code": "unauthorized", "message": "Sign in to continue."}}), 401
-            token = authorization[7:].strip()
-            if not token:
-                return jsonify({"error": {"code": "unauthorized", "message": "Sign in to continue."}}), 401
-            try:
-                response = client.auth.get_user(token)
-                user = response.user
-            except Exception:
-                current_app.logger.info("Supabase rejected an access token.")
-                return jsonify({"error": {"code": "unauthorized", "message": "Your session is invalid or has expired."}}), 401
-            if user is None:
-                return jsonify({"error": {"code": "unauthorized", "message": "Your session is invalid or has expired."}}), 401
-            g.user = user
-            if current_app.testing and not current_app.config.get("SUPABASE_ANON_KEY"):
-                g.supabase = client
-            else:
-                try:
-                    g.supabase = create_client(
-                        current_app.config["SUPABASE_URL"],
-                        current_app.config["SUPABASE_ANON_KEY"],
-                        SyncClientOptions(headers={"Authorization": f"Bearer {token}"}),
-                    )
-                except Exception:
-                    current_app.logger.exception("Could not initialize the authenticated Supabase client.")
-                    return jsonify({"error": {"code": "service_unavailable", "message": "Database access is temporarily unavailable."}}), 503
-            try:
-                memberships = (
-                    g.supabase.table("organization_memberships")
-                    .select("organization_id,role,status")
-                    .eq("user_id", user.id)
-                    .eq("status", "active")
-                    .execute()
-                    .data
+            statement = (
+                select(users, memberships.c.organization_id, memberships.c.role)
+                .join(memberships, memberships.c.user_id == users.c.id)
+                .where(
+                    users.c.id == user_id,
+                    users.c.is_active.is_(True),
+                    memberships.c.organization_id == organization_id,
+                    memberships.c.status == "active",
                 )
-            except Exception:
-                current_app.logger.exception("Membership lookup failed.")
-                return jsonify({"error": {"code": "service_unavailable", "message": "Access could not be verified."}}), 503
-            requested_org = request.headers.get("X-Organization-ID")
-            membership = next(
-                (m for m in memberships or [] if requested_org and m["organization_id"] == requested_org),
-                None,
             )
-            if not requested_org and memberships:
-                membership = memberships[0]
-            if membership is None:
-                return jsonify({"error": {"code": "forbidden", "message": "You are not a member of this organization."}}), 403
-            g.organization_id = membership["organization_id"]
-            g.role = membership["role"]
-            if roles and g.role not in roles:
-                return jsonify({"error": {"code": "forbidden", "message": "Your role cannot perform this action."}}), 403
-            return handler(*args, **kwargs)
+            row = db.session.execute(statement).mappings().first()
+            if not row:
+                session.clear()
+                return jsonify({"error": {"code": "unauthorized", "message": "Your session is no longer authorized."}}), 401
+            role = row["role"]
+            if roles and role not in roles:
+                return jsonify({"error": {"code": "forbidden", "message": "Your account cannot perform this action."}}), 403
+            g.user = SimpleNamespace(id=row["id"], email=row["email"], full_name=row["full_name"])
+            g.organization_id = row["organization_id"]
+            g.role = role
+            return view(*args, **kwargs)
 
         return wrapped
 
-    return decorator
+    return decorate
+
+
+def login(email, password):
+    if len(password) > 512:
+        return None
+    row = db.session.execute(select(users).where(users.c.email == email.lower())).mappings().first()
+    if not row or not row["is_active"] or not check_password_hash(row["password_hash"], password):
+        return None
+    organization_rows = db.session.execute(
+        select(memberships.c.organization_id, memberships.c.role)
+        .where(memberships.c.user_id == row["id"], memberships.c.status == "active")
+    ).all()
+    if len(organization_rows) != 1:
+        current_app.logger.info("Account sign-in requires exactly one active organization membership.")
+        return None
+    return row, organization_rows[0]

@@ -32,7 +32,6 @@
     </main>
   </div>
   <dialog id="record-dialog"><form id="record-form"><div class="panel-heading"><h2 id="form-title">Add record</h2><button type="button" id="close-dialog" class="icon-button" aria-label="Close">×</button></div><div id="form-fields" class="form-grid"></div><p id="form-message" role="alert"></p><button class="primary">Save record</button></form></dialog>
-  <script>window.WATERCARE_SUPABASE_URL={{ supabase_url|tojson }};window.WATERCARE_SUPABASE_ANON_KEY={{ supabase_anon_key|tojson }};</script>
   <script src="{{ url_for('static', filename='js/app.js') }}" defer></script>
 </body>
 </html>
