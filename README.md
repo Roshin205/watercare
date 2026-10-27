@@ -134,3 +134,11 @@ Once an engineer's completion is approved, everyone who can see that project get
 fills the newest template for the project's service and downloads it as a PDF. Fonts are kept as in the template and no
 text is bold. The PDF is made by LibreOffice (install it on the server and make sure `soffice` is on PATH) or, on a Windows
 computer, by Microsoft PowerPoint/Word; without either the download shows an error.
+
+## Deploying with the Render Blueprint
+
+`render.yaml` and the `Dockerfile` set up a Docker web service with a persistent disk at `/var/data`, the health check
+at `/api/health` and `flask --app main:app db upgrade` as the pre-deploy step. In Render choose New > Blueprint, pick this
+repository, and enter `DATABASE_URL` (a Supabase Session pooler URL or a Render PostgreSQL internal URL) when asked.
+`SECRET_KEY` is generated for you. Afterwards open the service Shell and run `flask --app main:app create-admin`.
+The image installs LibreOffice so certificate PDFs work.
