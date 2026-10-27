@@ -3,6 +3,7 @@ import logging
 import os
 import hmac
 import re
+import tempfile
 from datetime import datetime, timezone
 from uuid import uuid4
 
@@ -41,7 +42,17 @@ def create_app(config_object=Config):
     db.init_app(app)
     migrate.init_app(app, db, directory=os.path.abspath(os.path.join(app.root_path, "..", "migrations")))
     app.extensions["watercare_database"] = Database()
-    os.makedirs(app.config["STORAGE_PATH"], exist_ok=True)
+    try:
+        os.makedirs(app.config["STORAGE_PATH"], exist_ok=True)
+    except OSError:
+        # With cloud files the local folder is never used; without them, fall back to a writable temporary folder.
+        fallback = os.path.join(tempfile.gettempdir(), "watercare-uploads")
+        os.makedirs(fallback, exist_ok=True)
+        if not all(app.config.get(key) for key in ("SUPABASE_URL", "SUPABASE_SECRET_KEY", "SUPABASE_BUCKET")):
+            logging.getLogger(__name__).warning(
+                "STORAGE_PATH %s is not writable; using %s, which is lost on restart.", app.config["STORAGE_PATH"], fallback,
+            )
+        app.config["STORAGE_PATH"] = fallback
     app.register_blueprint(api, url_prefix="/api")
 
     @app.before_request
