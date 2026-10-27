@@ -47,3 +47,10 @@ test("explicit-search fallback results use the same shape", () => {
   ]), [{ label: "Dubai Marina", detail: "Dubai, United Arab Emirates", type: "neighbourhood", lat: 25.0786, lng: 55.1352 }]);
   assert.deepEqual(places.fromNominatim({ error: "unavailable" }), []);
 });
+
+test("a pin's address lookup result becomes a readable address", () => {
+  assert.deepEqual(places.fromNominatimReverse({ display_name: "Al Marasi Drive, Business Bay, Dubai, United Arab Emirates", type: "road", lat: "25.18", lon: "55.26" }),
+    [{ label: "Al Marasi Drive", detail: "Business Bay, Dubai, United Arab Emirates", type: "road", lat: 25.18, lng: 55.26 }]);
+  assert.deepEqual(places.fromNominatimReverse({ error: "Unable to geocode" }), []);
+  assert.deepEqual(places.fromNominatimReverse(null), []);
+});

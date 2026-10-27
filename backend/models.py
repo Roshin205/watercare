@@ -31,6 +31,8 @@ users = Table(
     Column("password_hash", String(255), nullable=False),
     Column("full_name", String(255)),
     Column("is_active", Boolean, nullable=False, default=True),
+    # Private key for admin sign-in, stored only as a hash; blank for accounts that use the client login.
+    Column("access_key_hash", String(255)),
     Column("created_at", String(40), nullable=False),
     Column("updated_at", String(40), nullable=False),
 )
@@ -122,6 +124,8 @@ projects = business_table(
     Column("status", String(40), nullable=False, default="Planned", index=True),
     Column("notes", Text),
     Column("completion_status", String(40)),
+    Column("completion_date", String(10)),
+    Column("completion_engineer_name", String(320)),
     Column("expected_duration", Integer),
     Column("completed_duration", Integer),
     Column("additional_duration", Integer),
@@ -234,4 +238,26 @@ audit_logs = Table(
     Column("old_data", JSON),
     Column("new_data", JSON),
     Column("created_at", String(40), nullable=False),
+)
+
+
+certificate_templates = business_table(
+    "certificate_templates",
+    Column("name", String(200), nullable=False),
+    Column("service", String(120), nullable=False, index=True),
+    Column("original_filename", String(255), nullable=False),
+    Column("file_type", String(8), nullable=False),
+    Column("storage_path", String(500), nullable=False),
+    Column("file_size", Integer, nullable=False),
+    Column("tags", JSON),
+)
+
+
+services = business_table(
+    "services",
+    Column("name", String(120), nullable=False),
+    Column("description", Text),
+    Column("certificate_text", String(300)),
+    Column("validity_months", Integer),
+    Column("is_active", Boolean, nullable=False, default=True),
 )

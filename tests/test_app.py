@@ -16,6 +16,9 @@ from backend.routes.api import safe_spreadsheet_value
 from backend.utils.validators import validate_payload
 
 
+ADMIN_KEY = "private-admin-key-1"
+
+
 class TestConfig:
     TESTING = True
     SECRET_KEY = "test-secret-key"
@@ -36,6 +39,7 @@ def app():
         db.session.execute(users.insert().values(
             id="user-1", email="admin@example.test", full_name="Admin",
             password_hash=generate_password_hash("secure-test-password"),
+            access_key_hash=generate_password_hash(ADMIN_KEY),
             is_active=True, created_at=now, updated_at=now,
         ))
         db.session.execute(memberships.insert().values(
@@ -52,6 +56,7 @@ def client(app):
     test_client = app.test_client()
     response = test_client.post("/api/auth/login", json={
         "email": "admin@example.test", "password": "secure-test-password",
+        "login_type": "admin", "access_key": ADMIN_KEY,
     })
     assert response.status_code == 200
     test_client.csrf_token = response.json["csrf_token"]
@@ -123,7 +128,7 @@ def test_csrf_and_authentication_are_required(app):
     assert anonymous.get("/api/clients").status_code == 401
     assert anonymous.post("/api/clients", json={"name": "Acme"}).status_code == 401
     client = app.test_client()
-    client.post("/api/auth/login", json={"email": "admin@example.test", "password": "secure-test-password"})
+    client.post("/api/auth/login", json={"email": "admin@example.test", "password": "secure-test-password", "login_type": "admin", "access_key": ADMIN_KEY})
     assert client.post("/api/clients", json={"name": "Acme"}).status_code == 403
 
 
@@ -210,15 +215,17 @@ def test_project_entry_completion_durations_and_multiple_images(client):
     assert project_days == ["2026-12-30", "2026-12-31"]
     assert next(task for task in calendar.json["data"] if task["scheduled_date"] == "2026-12-30")["scheduled_time"] == "08:30"
 
+    upload_completion_images(client, project_id)
     completed = client.patch(f"/api/projects/{project_id}", headers=csrf(client), json={
-        "completion_status": "Completed Late",
-        "expected_duration": 10,
-        "completed_duration": 12,
+        "completion_date": "2026-12-31",
+        "completion_engineer_name": "Assigned Engineer",
+        "invoice_number": "INV-1234",
     })
     assert completed.status_code == 200, completed.json
-    assert completed.json["data"]["approval_status"] == "Submitted for Approval"
+    assert completed.json["data"]["approval_status"] == "Pending Approval"
     assert completed.json["data"]["status"] != "Completed"
-    assert completed.json["data"]["additional_duration"] == 2
+    assert completed.json["data"]["completion_date"] == "2026-12-31"
+    assert completed.json["data"]["completion_engineer_name"] == "Assigned Engineer"
 
     for image_type, filename in (("before", "before.png"), ("after", "after.png")):
         uploaded = client.post(
@@ -272,8 +279,11 @@ def test_named_engineer_can_complete_assigned_project(app, client):
     visible = engineer.get("/api/projects")
     assert visible.status_code == 200
     assert any(item["id"] == project["id"] for item in visible.json["data"])
+    upload_completion_images(engineer, project["id"])
     completed = engineer.patch(f"/api/projects/{project['id']}", headers=csrf(engineer), json={
-        "completion_status": "Completed Within Contract Period",
+        "completion_date": "2026-12-30",
+        "completion_engineer_name": "Field Engineer",
+        "invoice_number": "INV-ENGINEER",
     })
     assert completed.status_code == 200
     for image_type, filename in (("before", "employee-before.png"), ("after", "employee-after.png")):
@@ -452,9 +462,6 @@ def test_payload_validation_and_spreadsheet_safety():
     assert "on or after" in validate_payload("projects", base_project)
     base_project["end_date"] = "2026-10-26"
     assert validate_payload("projects", base_project) is None
-    base_project["service"] = "Other"
-    assert "Unsupported project service" in validate_payload("projects", base_project)
-    base_project["service"] = "Water testing"
     base_project["microbiology_frequency"] = "No"
     assert "required when" in validate_payload("projects", base_project)
     base_project.update({"microbiology_frequency": "Alternative", "visit_time": "09:30"})
@@ -466,9 +473,15 @@ def test_payload_validation_and_spreadsheet_safety():
 ROLE_PASSWORD = "role-test-password-1"
 
 
-def sign_in(app, email, password=ROLE_PASSWORD):
+ROLE_KEY = "role-private-key-1"
+
+
+def sign_in(app, email, password=ROLE_PASSWORD, key=None):
     test_client = app.test_client()
-    response = test_client.post("/api/auth/login", json={"email": email, "password": password})
+    body = {"email": email, "password": password}
+    if key:
+        body.update(login_type="admin", access_key=key)
+    response = test_client.post("/api/auth/login", json=body)
     assert response.status_code == 200, response.json
     test_client.csrf_token = response.json["csrf_token"]
     return test_client
@@ -476,11 +489,12 @@ def sign_in(app, email, password=ROLE_PASSWORD):
 
 def add_account(app, admin, role, name):
     email = f"{role.replace('_', '-')}-{uuid4().hex[:6]}@example.test"
+    key = ROLE_KEY if role in {"service_coordinator", "accountant"} else None
     created = admin.post("/api/auth/users", headers=csrf(admin), json={
-        "email": email, "full_name": name, "password": ROLE_PASSWORD, "role": role,
+        "email": email, "full_name": name, "password": ROLE_PASSWORD, "role": role, **({"access_key": key} if key else {}),
     })
     assert created.status_code == 201, created.json
-    return sign_in(app, email)
+    return sign_in(app, email, key=key)
 
 
 def new_project(test_client, **values):
@@ -494,6 +508,22 @@ def new_project(test_client, **values):
     response = test_client.post("/api/projects", headers=csrf(test_client), json=payload)
     assert response.status_code == 201, response.json
     return response.json["data"]
+
+
+def upload_completion_images(test_client, project_id):
+    for image_type in ("before", "after"):
+        uploaded = test_client.post(
+            "/api/uploads",
+            headers=csrf(test_client),
+            data={
+                "related_type": "project",
+                "related_id": project_id,
+                "image_type": image_type,
+                "file": (BytesIO(b"\x89PNG\r\n\x1a\nimage"), f"{image_type}.png", "image/png"),
+            },
+            content_type="multipart/form-data",
+        )
+        assert uploaded.status_code == 201, uploaded.json
 
 
 def employee_with_engineer(app, admin, name, code):
@@ -635,19 +665,56 @@ def test_date_filter_returns_only_work_recorded_for_the_selected_date(client):
 def test_invoice_number_is_saved_with_the_completion(client):
     project = new_project(client)
     headers = csrf(client)
+    upload_completion_images(client, project["id"])
     too_long = client.patch(f"/api/projects/{project['id']}", headers=headers, json={
-        "completion_status": "Completed Within Contract Period", "invoice_number": "X" * 101,
+        "completion_date": "2026-11-10",
+        "completion_engineer_name": "Engineer", "invoice_number": "X" * 101,
     })
     assert too_long.status_code == 400
     submitted = client.patch(f"/api/projects/{project['id']}", headers=headers, json={
-        "completion_status": "Completed Within Contract Period", "invoice_number": "  INV-2026-0042 ",
+        "completion_date": "2026-11-10",
+        "completion_engineer_name": "Engineer", "invoice_number": "  INV-2026-0042 ",
     })
     assert submitted.status_code == 200
     assert client.get(f"/api/projects/{project['id']}").json["data"]["invoice_number"] == "INV-2026-0042"
     corrected = client.patch(f"/api/projects/{project['id']}", headers=headers, json={"invoice_number": "INV-2026-0043"})
     assert corrected.status_code == 200
     assert corrected.json["data"]["invoice_number"] == "INV-2026-0043"
-    assert corrected.json["data"]["approval_status"] == "Submitted for Approval"
+    assert corrected.json["data"]["approval_status"] == "Pending Approval"
+
+
+def test_completion_requires_photos_and_derives_timing_from_actual_date(client):
+    project = new_project(client)
+    url = f"/api/projects/{project['id']}"
+    payload = {
+        "completion_date": "2026-11-09",
+        "completion_engineer_name": "Engineer",
+        "invoice_number": "INV-1",
+        "completion_status": "Completed After the Scheduled Date",
+    }
+    missing_photos = client.patch(url, headers=csrf(client), json=payload)
+    assert missing_photos.status_code == 400
+    assert "both before-work and after-work photos" in missing_photos.json["error"]["message"]
+
+    upload_completion_images(client, project["id"])
+    submitted = client.patch(url, headers=csrf(client), json=payload)
+    assert submitted.status_code == 200
+    assert submitted.json["data"]["approval_status"] == "Pending Approval"
+    assert submitted.json["data"]["completion_status"] == "Completed Before the Scheduled Date"
+
+    for index, (actual_date, expected_status) in enumerate((
+        ("2026-11-10", "Completed on the Scheduled Date"),
+        ("2026-11-11", "Completed After the Scheduled Date"),
+    ), start=1):
+        same_day_project = new_project(client, name=f"Completion timing {index}", so_no=600 + index)
+        upload_completion_images(client, same_day_project["id"])
+        result = client.patch(f"/api/projects/{same_day_project['id']}", headers=csrf(client), json={
+            "completion_date": actual_date,
+            "completion_engineer_name": "Engineer",
+            "invoice_number": f"INV-{index}",
+        })
+        assert result.status_code == 200
+        assert result.json["data"]["completion_status"] == expected_status
 
 
 def test_completion_submission_approval_rejection_and_history(app, client):
@@ -658,13 +725,19 @@ def test_completion_submission_approval_rejection_and_history(app, client):
     assert project["approval_status"] == "Pending"
     url = f"/api/projects/{project['id']}"
 
+    upload_completion_images(employee, project["id"])
     submitted = employee.patch(url, headers=csrf(employee), json={
-        "completion_status": "Completed Late", "expected_duration": 5, "completed_duration": 7, "invoice_number": "INV-1",
+        "completion_date": "2026-11-11",
+        "completion_engineer_name": "Field Engineer", "invoice_number": "INV-1",
     })
     assert submitted.status_code == 200, submitted.json
-    assert submitted.json["data"]["approval_status"] == "Submitted for Approval"
+    assert submitted.json["data"]["approval_status"] == "Pending Approval"
+    assert submitted.json["data"]["completion_date"] == "2026-11-11"
     assert submitted.json["data"]["status"] != "Completed"
-    assert employee.patch(url, headers=csrf(employee), json={"completion_status": "Completed Early", "expected_duration": 5, "completed_duration": 4}).status_code == 409
+    assert employee.patch(url, headers=csrf(employee), json={
+        "completion_date": "2026-11-09",
+        "completion_engineer_name": "Field Engineer", "invoice_number": "INV-1",
+    }).status_code == 409
     assert employee.post(f"{url}/approve", headers=csrf(employee)).status_code == 403
     assert [row["id"] for row in accountant.get("/api/approvals").json["data"]] == [project["id"]]
 
@@ -676,30 +749,38 @@ def test_completion_submission_approval_rejection_and_history(app, client):
     assert accountant.post(f"{url}/approve", headers=csrf(accountant)).status_code == 409
 
     resubmitted = employee.patch(url, headers=csrf(employee), json={
-        "completion_status": "Completed Late", "expected_duration": 5, "completed_duration": 7, "invoice_number": "INV-2",
+        "completion_date": "2026-11-11",
+        "completion_engineer_name": "Field Engineer", "invoice_number": "INV-2",
     })
     assert resubmitted.status_code == 200
-    assert resubmitted.json["data"]["approval_status"] == "Submitted for Approval"
+    assert resubmitted.json["data"]["approval_status"] == "Pending Approval"
     assert resubmitted.json["data"]["rejection_reason"] is None
     approved = coordinator.post(f"{url}/approve", headers=csrf(coordinator))
     assert approved.status_code == 200
     assert (approved.json["data"]["approval_status"], approved.json["data"]["status"]) == ("Approved", "Completed")
     assert coordinator.post(f"{url}/approve", headers=csrf(coordinator)).status_code == 409
-    assert employee.patch(url, headers=csrf(employee), json={"completion_status": "Completed Within Contract Period"}).status_code == 409
+    assert employee.patch(url, headers=csrf(employee), json={
+        "completion_date": "2026-11-10",
+        "completion_engineer_name": "Field Engineer", "invoice_number": "INV-2",
+    }).status_code == 409
 
     history = coordinator.get(f"/api/approval-history?project_id={project['id']}").json["data"]
     assert [(row["action"], row["previous_status"], row["new_status"], row["actor_name"]) for row in history] == [
-        ("Approved", "Submitted for Approval", "Approved", "Sara Coordinator"),
-        ("Resubmitted", "Rejected", "Submitted for Approval", "Field Engineer"),
-        ("Rejected", "Submitted for Approval", "Rejected", "Omar Accountant"),
-        ("Submitted", "Pending", "Submitted for Approval", "Field Engineer"),
+        ("Approved", "Pending Approval", "Approved", "Sara Coordinator"),
+        ("Resubmitted", "Rejected", "Pending Approval", "Field Engineer"),
+        ("Rejected", "Pending Approval", "Rejected", "Omar Accountant"),
+        ("Submitted", "Pending", "Pending Approval", "Field Engineer"),
     ]
     assert history[2]["reason"] == "After photos are missing."
     assert all(row["created_at"] and row["project_id"] == project["id"] for row in history)
     assert "Gulf Towers" in history[0]["reference"] and "Cooling Tower" in history[0]["reference"] and "SO 777" in history[0]["reference"]
 
     other = new_project(coordinator, name="Unassigned Project")
-    coordinator.patch(f"/api/projects/{other['id']}", headers=csrf(coordinator), json={"completion_status": "Completed Within Contract Period"})
+    upload_completion_images(coordinator, other["id"])
+    coordinator.patch(f"/api/projects/{other['id']}", headers=csrf(coordinator), json={
+        "completion_date": "2026-11-10",
+        "completion_engineer_name": "Engineer", "invoice_number": "INV-OTHER",
+    })
     assert {row["project_id"] for row in employee.get("/api/approval-history").json["data"]} == {project["id"]}
     assert len(coordinator.get("/api/approval-history").json["data"]) == 5
 
@@ -762,9 +843,13 @@ def test_migration_adds_new_fields_and_keeps_existing_records(tmp_path):
             connection.execute(text("INSERT INTO clients (id, organization_id, name, is_active, created_at, updated_at) VALUES ('c', 'o', 'Existing Client', 1, :now, :now)"), {"now": now})
             for project_id, status in (("p-open", "Planned"), ("p-done", "Completed")):
                 connection.execute(text(
-                    "INSERT INTO projects (id, organization_id, client_id, name, status, engineer_visit, microbiology_frequency, created_at, updated_at) "
-                    "VALUES (:id, 'o', 'c', :id, :status, 'Monthly', 'Weekly', :now, :now)"
-                ), {"id": project_id, "status": status, "now": now})
+                    "INSERT INTO projects (id, organization_id, client_id, name, status, completion_status, engineer_visit, microbiology_frequency, created_at, updated_at) "
+                    "VALUES (:id, 'o', 'c', :id, :status, :completion_status, 'Monthly', 'Weekly', :now, :now)"
+                ), {
+                    "id": project_id, "status": status,
+                    "completion_status": "Completed Early" if status == "Completed" else None,
+                    "now": now,
+                })
             connection.execute(text("INSERT INTO engineers (id, organization_id, full_name, is_active, created_at, updated_at) VALUES ('e', 'o', 'Existing Engineer', 1, :now, :now)"), {"now": now})
         upgrade()
         inspector = inspect(db.engine)
@@ -775,10 +860,12 @@ def test_migration_adds_new_fields_and_keeps_existing_records(tmp_path):
         assert "engineer_code" in {column["name"] for column in inspector.get_columns("engineers")}
         assert "approval_history" in inspector.get_table_names()
         with db.engine.connect() as connection:
-            assert connection.execute(text("SELECT version_num FROM alembic_version")).scalar() == "202610270007"
+            assert connection.execute(text("SELECT version_num FROM alembic_version")).scalar() == "202610300010"
             assert connection.execute(text("SELECT role FROM organization_memberships WHERE id = 'mm'")).scalar() == "service_coordinator"
+            assert {"completion_date", "completion_engineer_name"} <= {column["name"] for column in inspector.get_columns("projects")}
             rows = dict(connection.execute(text("SELECT id, approval_status FROM projects")).all())
             assert rows == {"p-open": "Pending", "p-done": None}
+            assert connection.execute(text("SELECT completion_status FROM projects WHERE id = 'p-done'")).scalar() == "Completed Before the Scheduled Date"
             assert connection.execute(text("SELECT engineer_visit || microbiology_frequency FROM projects WHERE id = 'p-open'")).scalar() == "MonthlyWeekly"
             assert connection.execute(text("SELECT count(*) FROM clients")).scalar() == 1
             assert connection.execute(text("SELECT full_name FROM engineers")).scalar() == "Existing Engineer"
@@ -796,18 +883,21 @@ def test_records_persist_after_the_application_restarts(tmp_path):
         db.session.execute(organizations.insert().values(id="org-p", name="Persist", created_at=now, updated_at=now))
         db.session.execute(users.insert().values(
             id="admin-p", email="persist@example.test", full_name="Persist Admin",
-            password_hash=generate_password_hash(ROLE_PASSWORD), is_active=True, created_at=now, updated_at=now,
+            password_hash=generate_password_hash(ROLE_PASSWORD), access_key_hash=generate_password_hash(ROLE_KEY),
+            is_active=True, created_at=now, updated_at=now,
         ))
         db.session.execute(memberships.insert().values(
             id=str(uuid4()), organization_id="org-p", user_id="admin-p", role="administrator", status="active", created_at=now,
         ))
         db.session.commit()
-        admin = sign_in(first, "persist@example.test")
+        admin = sign_in(first, "persist@example.test", key=ROLE_KEY)
         engineer = admin.post("/api/engineers", headers=csrf(admin), json={"full_name": "Persisted Engineer", "engineer_code": "ENG-900"}).json["data"]
         project = new_project(admin, engineer_name="Persisted Engineer", assigned_engineer_ids=[engineer["id"]],
                               engineer_visit="Custom", engineer_visit_custom_date="2026-12-24", latitude=21.4858, longitude=39.1925)
+        upload_completion_images(admin, project["id"])
         admin.patch(f"/api/projects/{project['id']}", headers=csrf(admin), json={
-            "completion_status": "Completed Within Contract Period", "invoice_number": "INV-PERSIST",
+            "completion_date": "2026-11-10",
+            "completion_engineer_name": "Persisted Engineer", "invoice_number": "INV-PERSIST",
         })
         admin.post(f"/api/projects/{project['id']}/reject", headers=csrf(admin), json={"reason": "Check invoice"})
         db.session.remove()
@@ -815,9 +905,10 @@ def test_records_persist_after_the_application_restarts(tmp_path):
 
     restarted = migration_app(database_path)
     with restarted.app_context():
-        admin = sign_in(restarted, "persist@example.test")
+        admin = sign_in(restarted, "persist@example.test", key=ROLE_KEY)
         saved = admin.get(f"/api/projects/{project['id']}").json["data"]
         assert (saved["engineer_visit_custom_date"], saved["invoice_number"], saved["approval_status"]) == ("2026-12-24", "INV-PERSIST", "Rejected")
+        assert (saved["completion_date"], saved["completion_engineer_name"]) == ("2026-11-10", "Persisted Engineer")
         assert (saved["latitude"], saved["longitude"], saved["rejection_reason"]) == (21.4858, 39.1925, "Check invoice")
         assert admin.get("/api/engineers").json["data"][0]["engineer_code"] == "ENG-900"
         assert [row["action"] for row in admin.get("/api/approval-history").json["data"]] == ["Rejected", "Submitted"]
@@ -885,6 +976,13 @@ def test_lists_filter_by_search_client_project_and_date(client):
     assert project_names(client, f"client_id={chiller['client_id']}") == ["Chiller Plant"]
     assert project_names(client, f"project_id={pool['id']}") == ["Pool System"]
     assert project_names(client, "from=2026-11-05&to=2026-11-06") == ["Pool System"]
+    services = {row["name"]: row["service"] for row in client.get("/api/projects").json["data"]}
+    kind = services["Pool System"]
+    other = "Tank cleaning" if kind == "Water testing" else "Water testing"
+    assert "Pool System" in project_names(client, f"service={kind}")
+    assert all(services[name] == kind for name in project_names(client, f"service={kind}"))
+    assert "Pool System" not in project_names(client, f"service={other}")
+    assert client.get("/api/projects?service=Other").json["data"] == []
     assert project_names(client, "from=2026-11-11&to=2026-11-30") == []
     assert project_names(client, "from=2026-12-02") == ["Chiller Plant"]
     for bad in ("from=2026-13-01", "from=2026-11-10&to=2026-11-01", "client_id=nope", f"search={'x' * 101}"):
@@ -909,3 +1007,272 @@ def test_lists_filter_by_search_client_project_and_date(client):
     export = client.get("/api/reports/export?resource=projects&format=csv&search=chiller")
     assert export.status_code == 200
     assert b"Chiller Plant" in export.data and b"Pool System" not in export.data
+
+
+# --- Admin login with a private key, client login, and employee logins made by administrators ---
+
+def login_attempt(app, **body):
+    return app.test_client().post("/api/auth/login", json=body)
+
+
+def test_admin_login_needs_the_private_key_and_client_login_needs_only_email_and_password(app, client):
+    admin = {"email": "admin@example.test", "password": "secure-test-password"}
+    assert login_attempt(app, **admin, login_type="admin", access_key=ADMIN_KEY).status_code == 200
+    assert login_attempt(app, **admin, login_type="admin").status_code == 400
+    assert login_attempt(app, **admin, login_type="admin", access_key="wrong-private-key").status_code == 401
+    assert login_attempt(app, email="admin@example.test", password="wrong", login_type="admin", access_key=ADMIN_KEY).status_code == 401
+    refused = login_attempt(app, **admin)
+    assert refused.status_code == 403 and "Admin login" in refused.json["error"]["message"]
+    assert login_attempt(app, **admin, login_type="other").status_code == 400
+
+    coordinator = add_account(app, client, "service_coordinator", "Key Coordinator")
+    email = coordinator.get("/api/auth/me").json["user"]["email"]
+    assert login_attempt(app, email=email, password=ROLE_PASSWORD).status_code == 403
+    assert login_attempt(app, email=email, password=ROLE_PASSWORD, login_type="admin", access_key=ADMIN_KEY).status_code == 401
+    assert login_attempt(app, email=email, password=ROLE_PASSWORD, login_type="admin", access_key=ROLE_KEY).status_code == 200
+
+    add_account(app, client, "employee", "Plain Employee")
+    employee_email = next(u["email"] for u in [client.get("/api/engineers").json["data"][0]] if u["email"])
+    employee = login_attempt(app, email=employee_email, password=ROLE_PASSWORD)
+    assert employee.status_code == 200 and employee.json["role"] == "employee"
+    refused = login_attempt(app, email=employee_email, password=ROLE_PASSWORD, login_type="admin", access_key=ROLE_KEY)
+    assert refused.status_code == 403 and "Client login" in refused.json["error"]["message"]
+
+    headers = csrf(client)
+    assert client.post("/api/auth/users", headers=headers, json={
+        "email": "nokey@example.test", "full_name": "No Key", "password": ROLE_PASSWORD, "role": "accountant",
+    }).status_code == 400
+    assert client.post("/api/auth/users", headers=headers, json={
+        "email": "keyed@example.test", "full_name": "Keyed", "password": ROLE_PASSWORD, "role": "employee", "access_key": ROLE_KEY,
+    }).status_code == 400
+    with app.app_context():
+        stored = db.session.execute(db.select(users.c.access_key_hash).where(users.c.email == "admin@example.test")).scalar()
+    assert stored and ADMIN_KEY not in stored
+
+
+def test_administrator_creates_and_resets_employee_logins_from_the_engineers_page(app, client):
+    headers = csrf(client)
+    created = client.post("/api/engineers", headers=headers, json={
+        "full_name": "Nadia Karim", "engineer_code": "ENG-300", "email": "Nadia@Gmail.test", "password": "nadia-login-pass-1",
+    })
+    assert created.status_code == 201, created.json
+    assert created.json["data"]["user_id"] and "password" not in created.json["data"]
+    signed_in = login_attempt(app, email="nadia@gmail.test", password="nadia-login-pass-1")
+    assert signed_in.status_code == 200 and signed_in.json["role"] == "employee"
+
+    assert client.post("/api/engineers", headers=headers, json={
+        "full_name": "Copy", "engineer_code": "ENG-301", "email": "nadia@gmail.test", "password": "another-long-pass-1",
+    }).status_code == 409
+    assert client.post("/api/engineers", headers=headers, json={
+        "full_name": "Short", "engineer_code": "ENG-302", "email": "short@gmail.test", "password": "short",
+    }).status_code == 400
+    assert client.post("/api/engineers", headers=headers, json={
+        "full_name": "No Mail", "engineer_code": "ENG-303", "password": "a-long-enough-pass-1",
+    }).status_code == 400
+
+    reset = client.patch(f"/api/engineers/{created.json['data']['id']}", headers=headers, json={"password": "nadia-new-password-2"})
+    assert reset.status_code == 200, reset.json
+    assert login_attempt(app, email="nadia@gmail.test", password="nadia-login-pass-1").status_code == 401
+    assert login_attempt(app, email="nadia@gmail.test", password="nadia-new-password-2").status_code == 200
+
+    plain = client.post("/api/engineers", headers=headers, json={"full_name": "Later Login", "engineer_code": "ENG-304", "email": "later@gmail.test"}).json["data"]
+    assert plain["user_id"] is None
+    assert client.patch(f"/api/engineers/{plain['id']}", headers=headers, json={"password": "later-login-pass-1"}).status_code == 200
+    assert login_attempt(app, email="later@gmail.test", password="later-login-pass-1").status_code == 200
+
+    coordinator = add_account(app, client, "service_coordinator", "Not Admin")
+    assert coordinator.post("/api/engineers", headers=csrf(coordinator), json={
+        "full_name": "Blocked", "engineer_code": "ENG-305", "email": "blocked@gmail.test", "password": "blocked-login-pass-1",
+    }).status_code == 403
+    assert coordinator.post("/api/engineers", headers=csrf(coordinator), json={"full_name": "Fine", "engineer_code": "ENG-306"}).status_code == 201
+
+
+def test_engineers_upload_profile_photos_with_the_right_permissions(app, client):
+    headers = csrf(client)
+    created = client.post("/api/engineers", headers=headers, json={
+        "full_name": "Photo Person", "engineer_code": "ENG-400", "email": "photo@gmail.test", "password": "photo-login-pass-1",
+    }).json["data"]
+    other = client.post("/api/engineers", headers=headers, json={"full_name": "Someone Else", "engineer_code": "ENG-401"}).json["data"]
+    png = b"\x89PNG\r\n\x1a\nprofile"
+
+    def send(test_client, engineer_id, data=png, name="me.png", image_type="profile"):
+        return test_client.post("/api/uploads", headers=csrf(test_client), content_type="multipart/form-data", data={
+            "related_type": "engineer", "related_id": engineer_id, "image_type": image_type, "file": (BytesIO(data), name, "image/png"),
+        })
+
+    employee = sign_in(app, "photo@gmail.test", "photo-login-pass-1")
+    first = send(employee, created["id"])
+    assert first.status_code == 201, first.json
+    assert send(employee, other["id"]).status_code in {403, 404}
+    assert send(employee, created["id"], b"not an image", "me.png").status_code == 400
+    assert send(employee, created["id"], b"%PDF-1.4 x", "me.pdf").status_code == 400
+    assert send(employee, created["id"], image_type="before").status_code == 400
+
+    listed = {row["id"]: row["photo_id"] for row in client.get("/api/engineers").json["data"]}
+    assert listed[created["id"]] == first.json["data"]["id"] and listed[other["id"]] is None
+    assert employee.get(f"/api/uploads/{first.json['data']['id']}?inline=1").status_code == 200
+
+    second = send(employee, created["id"], png + b"2", "new.png")
+    assert second.status_code == 201
+    assert client.get(f"/api/uploads/{first.json['data']['id']}").status_code == 404
+    assert {row["id"]: row["photo_id"] for row in client.get("/api/engineers").json["data"]}[created["id"]] == second.json["data"]["id"]
+
+    assert send(client, other["id"]).status_code == 201
+    viewer = add_account(app, client, "viewer", "Photo Viewer")
+    assert send(viewer, other["id"]).status_code == 403
+    assert viewer.post("/api/uploads", headers=csrf(viewer), content_type="multipart/form-data", data={
+        "related_type": "client", "related_id": str(uuid4()), "file": (BytesIO(b"%PDF-1.4 x"), "a.pdf", "application/pdf"),
+    }).status_code == 403
+
+
+def test_projects_export_uses_the_client_schedule_layout(client):
+    from io import BytesIO
+    from openpyxl import load_workbook
+    new_project(client, client_name="Daikin", name="True Bell", so_no=1087, start_date="2026-07-01", end_date="2027-03-31",
+                system_details="CT - 2 samples\nCHW 1 - 1 samples", engineer_visit="Quarterly",
+                microbiology="Yes", microbiology_frequency="Quarterly", legionella="No")
+    new_project(client, client_name="Daikin", name="Chef Middle East", so_no=846, start_date="2026-01-01", end_date="2026-12-31")
+    new_project(client, client_name="Acme", name="Solo", so_no=7, start_date="2026-05-01", end_date="2026-05-20")
+    response = client.get("/api/reports/export?resource=projects&format=xlsx")
+    assert response.status_code == 200
+    sheet = load_workbook(BytesIO(response.data)).active
+    assert [cell.value for cell in sheet[1]] == [
+        "SL NO", "Client", None, "Project", "SO Number", "Contract Period", "System Details",
+        "Engineer Visit", "Microbiology", "Legionella",
+    ]
+    rows = [[cell.value for cell in row] for row in sheet.iter_rows(min_row=2)]
+    assert rows[0][:2] == [1, "Acme"] and rows[0][5] == "May 2026"
+    assert rows[1][:5] == [2, "Daikin", 1, "Chef Middle East", 846]
+    assert rows[2][:5] == [None, None, 2, "True Bell", 1087]
+    assert rows[2][5] == "July 2026 to March 2027"
+    assert rows[2][6] == "CT - 2 samples\nCHW 1 - 1 samples"
+    assert rows[2][7:] == ["Quarterly", "Yes quarterly", "NO"]
+    assert {str(r) for r in sheet.merged_cells.ranges} == {"A3:A4", "B3:B4"}
+    assert sheet["B2"].fill.fgColor.rgb.endswith("FFFF00") and sheet["B2"].font.bold
+    for fmt in ("csv", "pdf"):
+        assert client.get(f"/api/reports/export?resource=projects&format={fmt}").status_code == 200
+
+
+def _certificate_file(text_runs):
+    """A one-slide deck whose text is split across several runs, the way PowerPoint often stores it."""
+    from io import BytesIO
+    from pptx import Presentation
+    from pptx.util import Inches
+    deck = Presentation()
+    slide = deck.slides.add_slide(deck.slide_layouts[6])
+    frame = slide.shapes.add_textbox(Inches(1), Inches(1), Inches(6), Inches(2)).text_frame
+    for index, runs in enumerate(text_runs):
+        paragraph = frame.paragraphs[0] if index == 0 else frame.add_paragraph()
+        for text in runs:
+            paragraph.add_run().text = text
+        paragraph.runs[0].font.bold = True
+    out = BytesIO()
+    deck.save(out)
+    return out.getvalue()
+
+
+def upload_template(test_client, service, deck, name="Certificate", filename="cert.pptx"):
+    from io import BytesIO
+    return test_client.post("/api/certificate-templates", headers=csrf(test_client), content_type="multipart/form-data",
+                            data={"name": name, "service": service, "file": (BytesIO(deck), filename)})
+
+
+def test_services_page_defaults_create_rename_and_in_use_rules(client):
+    headers = csrf(client)
+    assert [row["name"] for row in client.get("/api/services").json["data"]] == ["Tank cleaning", "Water testing"]
+
+    created = client.post("/api/services", headers=headers, json={"name": "Legionella audit", "certificate_text": "Cooling Tower System", "validity_months": 3})
+    assert created.status_code == 201, created.json
+    service = created.json["data"]
+    assert service["is_active"] is True
+    assert client.post("/api/services", headers=headers, json={"name": "legionella AUDIT"}).status_code == 409
+    assert client.post("/api/services", headers=headers, json={"name": "Bad", "validity_months": 0}).status_code == 400
+
+    assert client.post("/api/projects", headers=headers, json={"client_name": "C", "name": "P", "service": "Not a service"}).status_code == 400
+    project = new_project(client, service="Legionella audit")
+    assert client.get(f"/api/projects?service=Legionella audit").json["data"][0]["id"] == project["id"]
+
+    renamed = client.patch(f"/api/services/{service['id']}", headers=headers, json={"name": "Legionella inspection"})
+    assert renamed.status_code == 200
+    assert client.get(f"/api/projects/{project['id']}").json["data"]["service"] == "Legionella inspection"
+    assert client.delete(f"/api/services/{service['id']}", headers=headers).status_code == 409
+
+    client.patch(f"/api/services/{service['id']}", headers=headers, json={"is_active": False})
+    assert client.post("/api/projects", headers=headers, json={"client_name": "C", "name": "P2", "service": "Legionella inspection"}).status_code == 400
+    unused = client.post("/api/services", headers=headers, json={"name": "Spare"}).json["data"]
+    assert client.delete(f"/api/services/{unused['id']}", headers=headers).status_code == 200
+
+
+def test_services_are_administrator_only_to_change(app, client):
+    coordinator = add_account(app, client, "service_coordinator", "Sara Coordinator")
+    viewer = add_account(app, client, "viewer", "Vic Viewer")
+    assert viewer.get("/api/services").status_code == 200
+    assert coordinator.post("/api/services", headers=csrf(coordinator), json={"name": "Nope"}).status_code == 403
+    assert viewer.post("/api/services", headers=csrf(viewer), json={"name": "Nope"}).status_code == 403
+
+
+def test_certificate_is_generated_for_the_client_after_admin_approval(app, client, monkeypatch):
+    from io import BytesIO
+    from pptx import Presentation
+    converted = {}
+
+    def fake_pdf(data, extension):
+        converted["data"], converted["extension"] = data, extension
+        return b"%PDF-1.4 certificate"
+
+    monkeypatch.setattr("backend.routes.api.convert_to_pdf", fake_pdf)
+    headers = csrf(client)
+    deck = _certificate_file([["{{client", "_name}}"], ["{{project_name}} | {{location}}"], ["{{service_text}}"], ["{{completion_date}} - {{expiry_date}}"]])
+
+    assert upload_template(client, "", deck).status_code == 400
+    assert upload_template(client, "Unknown service", deck).status_code == 400
+    assert upload_template(client, "Tank cleaning", b"not a deck").status_code == 400
+    assert upload_template(client, "Tank cleaning", b"hello", filename="note.txt").status_code == 400
+    saved = upload_template(client, "Tank cleaning", deck, name="Disinfection")
+    assert saved.status_code == 201, saved.json
+    template = saved.json["data"]
+    assert template["service"] == "Tank cleaning" and "tags" not in template and "storage_path" not in template
+    assert [(row["name"], row["service"]) for row in client.get("/api/certificate-templates").json["data"]] == [("Disinfection", "Tank cleaning")]
+
+    employee, profile = employee_with_engineer(app, client, "Field Engineer", "ENG-077")
+    project = new_project(client, client_name="IMDAAD LLC", name="VENETO VILLA - 01", service="Tank cleaning",
+                          location="Veneto Villa, Dubai, UAE", engineer_name="Field Engineer", assigned_engineer_ids=[profile["id"]])
+    url = f"/api/projects/{project['id']}"
+    assert employee.get(f"{url}/certificate").status_code == 409
+
+    upload_completion_images(employee, project["id"])
+    assert employee.patch(url, headers=csrf(employee), json={
+        "completion_date": "2026-09-09", "completion_engineer_name": "Field Engineer", "invoice_number": "INV-9",
+    }).status_code == 200
+    assert employee.get(f"{url}/certificate").status_code == 409
+    assert client.post(f"{url}/approve", headers=headers).status_code == 200
+
+    certificate = employee.get(f"{url}/certificate")
+    assert certificate.status_code == 200
+    assert certificate.mimetype == "application/pdf" and certificate.data.startswith(b"%PDF")
+    assert "certificate-VENETO_VILLA_-_01.pdf" in certificate.headers["Content-Disposition"]
+    filled = Presentation(BytesIO(converted["data"])).slides[0]
+    assert converted["extension"] == "pptx"
+    assert all(run.font.bold is False for shape in filled.shapes for p in shape.text_frame.paragraphs for run in p.runs)
+    text = "\n".join(p.text for shape in filled.shapes for p in shape.text_frame.paragraphs)
+    assert "IMDAAD LLC" in text and "VENETO VILLA - 01 | Veneto Villa, Dubai, UAE" in text
+    assert "Domestic Water Tank and Pipeline Network." in text
+    assert "09/09/2026 - 09/03/2027" in text and "{{" not in text
+
+    def no_converter(data, extension):
+        from backend.utils.pdf_convert import PdfUnavailable
+        raise PdfUnavailable("none")
+
+    monkeypatch.setattr("backend.routes.api.convert_to_pdf", no_converter)
+    assert employee.get(f"{url}/certificate").status_code == 503
+    assert client.get(f"/api/certificate-templates/{template['id']}/preview").status_code == 503
+    monkeypatch.setattr("backend.routes.api.convert_to_pdf", fake_pdf)
+    preview = client.get(f"/api/certificate-templates/{template['id']}/preview")
+    assert preview.status_code == 200 and preview.mimetype == "application/pdf"
+    assert "Sample Client LLC" in "\n".join(p.text for shape in Presentation(BytesIO(converted["data"])).slides[0].shapes for p in shape.text_frame.paragraphs)
+    assert employee.get(f"/api/certificate-templates/{template['id']}/preview").status_code == 403
+    other = new_project(client, service="Water testing")
+    assert client.get(f"/api/projects/{other['id']}/certificate").status_code == 409
+    assert client.delete(f"/api/certificate-templates/{template['id']}", headers=headers).status_code == 200
+    assert client.get(f"{url}/certificate").status_code == 404
+    assert client.get("/api/certificate-templates").json["data"] == []

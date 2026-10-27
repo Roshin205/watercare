@@ -41,8 +41,11 @@
       return { label, detail: rest.join(", "), type: readable(item.type), lat: Number(item.lat), lng: Number(item.lon) };
     }).filter(usable));
   }
+  function fromNominatimReverse(body) {
+    return body && !body.error && body.display_name ? fromNominatim([body]) : [];
+  }
   function fullName(place) { return [place.label, place.detail].filter(Boolean).join(", "); }
-  const api = { coordinates, coordinatePair, fromPhoton, fromNominatim, fullName };
+  const api = { coordinates, coordinatePair, fromPhoton, fromNominatim, fromNominatimReverse, fullName };
   if (typeof module === "object" && module.exports) module.exports = api;
   else root.WaterCarePlaces = api;
 })(this);

@@ -22,7 +22,12 @@ RESOURCE_FIELDS = {
             "microbiology", "microbiology_frequency", "microbiology_custom_date",
             "legionella", "legionella_frequency", "legionella_custom_date",
             "completion_status", "expected_duration", "completed_duration", "additional_duration", "invoice_number",
+            "completion_date", "completion_engineer_name",
         },
+    },
+    "services": {
+        "required": ("name",),
+        "fields": {"name", "description", "certificate_text", "validity_months", "is_active"},
     },
     "project_tasks": {
         "required": ("project_id", "title", "scheduled_date"),
@@ -44,8 +49,12 @@ SETTINGS_FIELDS = {
 PROJECT_STATUSES = {"Planned", "Scheduled", "In Progress", "Completed", "On Hold", "Cancelled"}
 CLEANING_STATUSES = {"Scheduled", "In Progress", "Completed", "Overdue", "Cancelled"}
 TASK_STATUSES = {"Planned", "Scheduled", "In Progress", "Completed", "On Hold", "Cancelled"}
-COMPLETION_STATUSES = {"Completed Early", "Completed Within Contract Period", "Completed Late"}
-APPROVAL_STATUSES = ("Pending", "Submitted for Approval", "Approved", "Rejected")
+COMPLETION_STATUSES = {
+    "Completed Before the Scheduled Date",
+    "Completed on the Scheduled Date",
+    "Completed After the Scheduled Date",
+}
+APPROVAL_STATUSES = ("Pending", "Pending Approval", "Approved", "Rejected")
 FREQUENCY_OPTIONS = ("Quarterly", "Alternative", "Custom")
 # Values offered before the current options; kept on projects that already use them.
 LEGACY_FREQUENCIES = {"Monthly", "Weekly"}
@@ -55,10 +64,10 @@ FREQUENCY_FIELDS = (
     ("legionella", "legionella_frequency", "legionella_custom_date"),
 )
 DATE_FIELDS = (
-    "scheduled_date", "start_date", "end_date", "cleaning_date", "next_recommended_date", "collection_date",
+    "scheduled_date", "start_date", "end_date", "completion_date", "cleaning_date", "next_recommended_date", "collection_date",
     "contract_period", "engineer_visit_custom_date", "microbiology_custom_date", "legionella_custom_date",
 )
-TEXT_LIMITS = {"engineer_code": 50, "invoice_number": 100}
+TEXT_LIMITS = {"engineer_code": 50, "invoice_number": 100, "completion_engineer_name": 320}
 
 
 def validate_payload(resource, payload, partial=False, current=None):
@@ -111,7 +120,7 @@ def validate_payload(resource, payload, partial=False, current=None):
         elif key == "is_active":
             if not isinstance(value, bool):
                 return "is_active must be a boolean."
-        elif key in {"so_no", "expected_duration", "completed_duration", "additional_duration"}:
+        elif key in {"so_no", "expected_duration", "completed_duration", "additional_duration", "validity_months"}:
             if value is None:
                 continue
             if isinstance(value, bool):
@@ -144,8 +153,6 @@ def validate_payload(resource, payload, partial=False, current=None):
     if resource == "projects" and "status" in payload and payload["status"] not in PROJECT_STATUSES:
         return "Unsupported project status."
     if resource == "projects":
-        if payload.get("service") and payload["service"] not in {"Water testing", "Tank cleaning"}:
-            return "Unsupported project service."
         if payload.get("start_date") and payload.get("end_date") and payload["start_date"] > payload["end_date"]:
             return "end_date must be on or after start_date."
         for field in ("microbiology", "legionella"):

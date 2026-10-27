@@ -72,7 +72,8 @@ def create_app(config_object=Config):
     @click.option("--name", prompt="Administrator name")
     @click.option("--organization", prompt="Organization name")
     @click.password_option()
-    def create_admin(email, name, organization, password):
+    @click.option("--access-key", prompt="Private admin key", hide_input=True, confirmation_prompt=True)
+    def create_admin(email, name, organization, password, access_key):
         """Create the first organization and administrator account."""
         from backend.database import db
         from backend.models import memberships, organizations, users
@@ -80,6 +81,8 @@ def create_app(config_object=Config):
         email = email.strip().lower()
         if not re.fullmatch(r"[^@\s]+@[^@\s]+\.[^@\s]+", email) or not 12 <= len(password) <= 512:
             raise click.ClickException("Use a valid email and a password between 12 and 512 characters.")
+        if not 12 <= len(access_key) <= 512:
+            raise click.ClickException("The private key must be between 12 and 512 characters.")
         now, organization_id, user_id = datetime.now(timezone.utc).isoformat(), str(uuid4()), str(uuid4())
         with db.engine.begin() as connection:
             if connection.execute(db.select(users.c.id).where(users.c.email == email.lower())).first():
@@ -90,6 +93,7 @@ def create_app(config_object=Config):
             connection.execute(users.insert().values(
                 id=user_id, email=email.lower(), full_name=name,
                 password_hash=generate_password_hash(password), is_active=True,
+                access_key_hash=generate_password_hash(access_key),
                 created_at=now, updated_at=now,
             ))
             connection.execute(memberships.insert().values(
@@ -97,6 +101,28 @@ def create_app(config_object=Config):
                 role="administrator", status="active", created_at=now,
             ))
         click.echo("Administrator account created.")
+
+    @app.cli.command("set-admin-key")
+    @click.option("--email", prompt=True)
+    @click.option("--access-key", prompt="New private admin key", hide_input=True, confirmation_prompt=True)
+    def set_admin_key(email, access_key):
+        """Set the private key an administrator, service coordinator or accountant uses on the Admin login."""
+        from backend.database import db
+        from backend.models import memberships, users
+
+        if not 12 <= len(access_key) <= 512:
+            raise click.ClickException("The private key must be between 12 and 512 characters.")
+        email = email.strip().lower()
+        with db.engine.begin() as connection:
+            row = connection.execute(db.select(users.c.id, memberships.c.role).join(
+                memberships, memberships.c.user_id == users.c.id
+            ).where(users.c.email == email)).first()
+            if not row or row.role not in {"administrator", "service_coordinator", "accountant"}:
+                raise click.ClickException("No admin-level account matched that email.")
+            connection.execute(users.update().where(users.c.id == row.id).values(
+                access_key_hash=generate_password_hash(access_key), updated_at=datetime.now(timezone.utc).isoformat(),
+            ))
+        click.echo("Private key saved.")
 
     @app.cli.command("set-password")
     @click.option("--email", prompt=True)

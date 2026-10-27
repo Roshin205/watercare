@@ -45,8 +45,15 @@ def require_user(roles=None):
     return decorate
 
 
-def login(email, password):
-    if len(password) > 512:
+ADMIN_LOGIN_ROLES = {"administrator", "service_coordinator", "accountant"}
+
+
+class LoginRefused(Exception):
+    """The email and password were right, but the account must use the other login."""
+
+
+def login(email, password, login_type="client", access_key=""):
+    if len(password) > 512 or len(access_key) > 512:
         return None
     row = db.session.execute(select(users).where(users.c.email == email.lower())).mappings().first()
     if not row or not row["is_active"] or not check_password_hash(row["password_hash"], password):
@@ -58,4 +65,13 @@ def login(email, password):
     if len(organization_rows) != 1:
         current_app.logger.info("Account sign-in requires exactly one active organization membership.")
         return None
+    role = organization_rows[0].role
+    if login_type == "admin":
+        if role not in ADMIN_LOGIN_ROLES:
+            raise LoginRefused("This account uses the Client login.")
+        # The key must exist and match; accounts without a key cannot use the admin login at all.
+        if not row["access_key_hash"] or not access_key or not check_password_hash(row["access_key_hash"], access_key):
+            return None
+    elif role in ADMIN_LOGIN_ROLES:
+        raise LoginRefused("This account uses the Admin login, with its private key.")
     return row, organization_rows[0]

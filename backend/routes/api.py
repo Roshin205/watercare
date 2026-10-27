@@ -20,7 +20,10 @@ from backend.models import (
     approval_history, engineers, memberships, project_engineers, project_tasks, projects,
     uploaded_documents, users, water_testing_records,
 )
-from backend.security.authentication import login, require_user
+from backend.utils import certificates as certs
+from backend.utils.pdf_convert import PdfUnavailable, convert_to_pdf
+from backend.utils.schedule_export import HEADERS as SCHEDULE_HEADERS, month_year, schedule_rows, schedule_workbook
+from backend.security.authentication import ADMIN_LOGIN_ROLES, LoginRefused, login, require_user
 from backend.utils.validators import (
     APPROVAL_STATUSES, FREQUENCY_FIELDS, RESOURCE_FIELDS, validate_payload, validate_settings,
 )
@@ -32,11 +35,12 @@ ADMIN = {"administrator"}
 EDITORS = {"administrator", "service_coordinator", "accountant"}
 APPROVERS = EDITORS
 ACCOUNT_ROLES = {"service_coordinator", "accountant", "employee", "viewer"}
-COMPLETION_FIELDS = {"completion_status", "expected_duration", "completed_duration", "additional_duration", "invoice_number"}
+COMPLETION_FIELDS = {"completion_status", "completion_date", "completion_engineer_name", "invoice_number"}
 RESOURCES = {
     "clients": ("clients", EDITORS),
     "engineers": ("engineers", EDITORS),
     "projects": ("projects", EDITORS),
+    "services": ("services", {"administrator"}),
     "project_tasks": ("project_tasks", EDITORS),
     "cleaning-records": ("cleaning_records", EDITORS),
     "water-testing": ("water_testing_records", EDITORS),
@@ -47,6 +51,7 @@ SEARCH_COLUMNS = {
     "clients": ("name", "organization_name", "contact_person", "phone", "email", "address", "category", "notes"),
     "engineers": ("engineer_code", "full_name", "email", "phone", "specialization", "availability"),
     "projects": ("name", "client_name", "service", "location", "system_details", "engineer_name", "invoice_number", "status", "approval_status"),
+    "services": ("name", "description", "certificate_text"),
     "project_tasks": ("title", "description", "location", "notes", "status"),
     "cleaning_records": ("site_name", "tank_identification", "tank_type", "location", "procedure", "materials_used", "observations", "notes", "status"),
     "water_testing_records": ("sample_identification", "sampling_location", "water_source", "testing_category", "interpretation", "laboratory_details", "notes", "status"),
@@ -114,6 +119,13 @@ def apply_list_filters(table, query, args):
         if column is None:
             raise ValueError(f"{label} filtering is not available for this list.")
         query = query.where(column == value)
+    service = args.get("service")
+    if service:
+        if len(service) > 120:
+            raise ValueError("Project type is too long.")
+        if "service" not in columns:
+            raise ValueError("Project type filtering is not available for this list.")
+        query = query.where(columns.service == service)
     start = checked_date(args["from"], "from") if args.get("from") else None
     end = checked_date(args["to"], "to") if args.get("to") else None
     if start and end and start > end:
@@ -222,9 +234,19 @@ def login_route():
     payload = request.get_json(silent=True)
     if not isinstance(payload, dict) or not isinstance(payload.get("email"), str) or not isinstance(payload.get("password"), str):
         return failure("invalid_request", "Email and password are required.", 400)
-    account = login(payload["email"].strip(), payload["password"])
+    login_type = payload.get("login_type", "client")
+    access_key = payload.get("access_key", "")
+    if login_type not in {"admin", "client"} or not isinstance(access_key, str):
+        return failure("invalid_request", "Choose the Admin login or the Client login.", 400)
+    if login_type == "admin" and not access_key:
+        return failure("invalid_request", "Enter your private key to use the Admin login.", 400)
+    try:
+        account = login(payload["email"].strip(), payload["password"], login_type, access_key)
+    except LoginRefused as error:
+        return failure("wrong_login", str(error), 403)
     if not account:
-        return failure("unauthorized", "Email or password is incorrect, or the account has no single active organization.", 401)
+        message = "Email, password or private key is incorrect." if login_type == "admin" else "Email or password is incorrect."
+        return failure("unauthorized", message, 401)
     user, membership = account
     session.clear()
     session.permanent = True
@@ -249,12 +271,13 @@ def logout_route():
 @require_user(roles=ADMIN)
 def create_user():
     payload = request.get_json(silent=True)
-    if not isinstance(payload, dict) or set(payload) - {"email", "full_name", "password", "role"}:
+    if not isinstance(payload, dict) or set(payload) - {"email", "full_name", "password", "role", "access_key"}:
         return failure("invalid_request", "Provide email, full_name, password, and role.", 400)
     email = payload.get("email")
     full_name = payload.get("full_name")
     password = payload.get("password")
     role = payload.get("role", "employee")
+    access_key = payload.get("access_key")
     if (
         not isinstance(email, str) or len(email) > 320 or not re.fullmatch(r"[^@\s]+@[^@\s]+\.[^@\s]+", email)
         or not isinstance(full_name, str) or not full_name.strip() or len(full_name) > 255
@@ -262,6 +285,11 @@ def create_user():
         or role not in ACCOUNT_ROLES
     ):
         return failure("invalid_request", "Use a valid email, name, role, and password of at least 12 characters.", 400)
+    if role in ADMIN_LOGIN_ROLES:
+        if not isinstance(access_key, str) or not 12 <= len(access_key) <= 512:
+            return failure("invalid_request", "Admin-level accounts need a private key of at least 12 characters.", 400)
+    elif access_key:
+        return failure("invalid_request", "Only admin-level accounts use a private key.", 400)
     existing = sqlalchemy_db.session.execute(select(users.c.id).where(users.c.email == email.lower())).first()
     if existing:
         return failure("conflict", "An account with this email already exists.", 409)
@@ -270,6 +298,7 @@ def create_user():
         sqlalchemy_db.session.execute(users.insert().values(
             id=user_id, email=email.lower(), full_name=full_name.strip(),
             password_hash=generate_password_hash(password), is_active=True,
+            access_key_hash=generate_password_hash(access_key) if role in ADMIN_LOGIN_ROLES else None,
             created_at=now, updated_at=now,
         ))
         sqlalchemy_db.session.execute(memberships.insert().values(
@@ -477,6 +506,8 @@ def collection(resource):
     @require_user()
     def get_collection():
         try:
+            if resource == "services":
+                ensure_default_services()
             query = scoped_query(table)
             try:
                 query = apply_list_filters(table, query, request.args)
@@ -500,6 +531,15 @@ def collection(resource):
                     engineer_map.setdefault(assignment["project_id"], []).append(assignment["engineer_id"])
                 for row in records:
                     row["assigned_engineer_ids"] = engineer_map.get(row["id"], [])
+            if resource == "engineers" and records:
+                photos = scoped_query("uploaded_documents").eq("related_type", "engineer").in_(
+                    "related_id", [row["id"] for row in records]
+                ).order("created_at", desc=True).execute().data or []
+                latest = {}
+                for photo in photos:
+                    latest.setdefault(photo["related_id"], photo["id"])
+                for row in records:
+                    row["photo_id"] = latest.get(row["id"])
             return jsonify({"data": records, "limit": limit, "offset": offset})
         except Exception:
             current_app.logger.exception("List query failed for %s.", resource)
@@ -511,9 +551,25 @@ def collection(resource):
         assigned_engineer_ids = payload.get("assigned_engineer_ids", []) if isinstance(payload, dict) and resource == "projects" else []
         if isinstance(payload, dict) and resource == "projects":
             payload = {key: value for key, value in payload.items() if key != "assigned_engineer_ids"}
+        login_password = None
+        if isinstance(payload, dict) and resource == "engineers" and "password" in payload:
+            payload = dict(payload)
+            login_password = payload.pop("password")
+            problem = _login_password_problem(login_password)
+            if problem:
+                return problem
+            if not isinstance(payload.get("email"), str) or not payload["email"].strip():
+                return failure("invalid_request", "Enter the employee's email to create their login.", 400)
         validation = validate_payload(rule_resource, payload)
         if validation:
             return failure("invalid_request", validation, 400)
+        problem = _service_problem(payload) if resource == "services" else (
+            _project_service_problem(payload) if resource == "projects" else None
+        )
+        if problem:
+            return problem
+        if login_password and _login_email_taken(payload["email"]):
+            return failure("conflict", "A login with this email already exists.", 409)
         if not isinstance(assigned_engineer_ids, list) or any(not isinstance(value, str) for value in assigned_engineer_ids):
             return failure("invalid_request", "assigned_engineer_ids must be a list of engineer IDs.", 400)
         if resource == "engineers" and _engineer_code_taken(payload):
@@ -530,6 +586,9 @@ def collection(resource):
             payload = dict(payload)
             payload["organization_id"] = g.organization_id
             payload["created_by"] = g.user.id
+            if login_password:
+                # Saved together with the engineer record in one commit.
+                payload["user_id"] = _stage_login(payload["email"], payload["full_name"], login_password)
             result = db().table(table).insert(payload).execute().data
             if not result:
                 return failure("database_error", "Record was not created.", 503)
@@ -575,7 +634,7 @@ def item(resource, item_id):
         payload = request.get_json(silent=True)
         if not isinstance(payload, dict) or not payload:
             return failure("invalid_request", "Provide at least one field to update.", 400)
-        submitting = resource == "projects" and "completion_status" in payload
+        submitting = resource == "projects" and "completion_date" in payload
         if g.role not in write_roles and (not submitting or set(payload) - COMPLETION_FIELDS):
             return failure("forbidden", "Employees may only submit completion details for their assigned projects.", 403)
         try:
@@ -588,17 +647,46 @@ def item(resource, item_id):
         current = current_rows[0]
         assigned_engineer_ids = payload.pop("assigned_engineer_ids", None) if resource == "projects" else None
         if submitting:
-            if current.get("approval_status") == "Submitted for Approval":
+            if current.get("approval_status") in {"Pending Approval", "Submitted for Approval"}:
                 return failure("conflict", "This completion is already awaiting approval.", 409)
             if current.get("approval_status") == "Approved":
                 return failure("conflict", "This completion has already been approved.", 409)
             try:
-                payload = _completion_values(payload)
+                payload = _completion_values(payload, current)
             except ValueError as error:
                 return failure("invalid_request", str(error), 400)
+            images = sqlalchemy_db.session.execute(
+                select(uploaded_documents.c.image_type).where(
+                    uploaded_documents.c.organization_id == g.organization_id,
+                    uploaded_documents.c.related_type == "project",
+                    uploaded_documents.c.related_id == item_id,
+                    uploaded_documents.c.image_type.in_(("before", "after")),
+                ).distinct()
+            ).scalars().all()
+            missing_images = {"before", "after"} - set(images)
+            if missing_images:
+                return failure("invalid_request", "Upload both before-work and after-work photos before submitting.", 400)
+        login_password = None
+        if resource == "engineers" and "password" in payload:
+            login_password = payload.pop("password")
+            problem = _login_password_problem(login_password)
+            if problem:
+                return problem
         validation = validate_payload(rule_resource, payload, partial=True, current=current if resource == "projects" else None)
         if validation:
             return failure("invalid_request", validation, 400)
+        problem = _service_problem(payload, current) if resource == "services" else (
+            _project_service_problem(payload, current) if resource == "projects" else None
+        )
+        if problem:
+            return problem
+        login_email = (payload.get("email") or current.get("email") or "").strip() if login_password else ""
+        if login_password:
+            if not current.get("user_id") and not re.fullmatch(r"[^@\s]+@[^@\s]+\.[^@\s]+", login_email):
+                return failure("invalid_request", "Enter the employee's email to create their login.", 400)
+            if not current.get("user_id") and _login_email_taken(login_email):
+                return failure("conflict", "A login with this email already exists.", 409)
+            payload["updated_by"] = g.user.id
         if resource == "projects" and {"start_date", "end_date"} & set(payload):
             project_start = payload.get("start_date", current.get("start_date"))
             project_end = payload.get("end_date", current.get("end_date"))
@@ -613,6 +701,11 @@ def item(resource, item_id):
         if resource == "engineers" and "engineer_code" in payload and _engineer_code_taken(payload, item_id):
             return failure("conflict", "Another engineer already uses this Engineer ID.", 409)
         try:
+            if login_password:
+                if current.get("user_id"):
+                    _stage_password_reset(current["user_id"], login_password)
+                else:
+                    payload["user_id"] = _stage_login(login_email, payload.get("full_name") or current["full_name"], login_password)
             if resource == "projects" and assigned_engineer_ids is not None:
                 _validate_engineer_ids(assigned_engineer_ids)
             _validate_relationships(resource, payload)
@@ -627,7 +720,7 @@ def item(resource, item_id):
             if submitting:
                 previous = current.get("approval_status")
                 updated = _change_approval(
-                    current, "Submitted for Approval", "Resubmitted" if previous == "Rejected" else "Submitted",
+                    current, "Pending Approval", "Resubmitted" if previous == "Rejected" else "Submitted",
                     {**payload, "rejection_reason": None},
                 )
             elif payload:
@@ -638,6 +731,12 @@ def item(resource, item_id):
                 )
             if resource == "projects" and assigned_engineer_ids is not None:
                 _replace_project_engineers(item_id, assigned_engineer_ids)
+            if resource == "services" and payload.get("name") and payload["name"] != current["name"]:
+                # Projects and templates refer to a service by name, so a rename carries them along.
+                for related in ("projects", "certificate_templates"):
+                    db().table(related).update({"service": payload["name"]}).eq(
+                        "organization_id", g.organization_id
+                    ).eq("service", current["name"]).execute()
             return jsonify({"data": (updated or record(table, item_id))[0]}), 200
         except ApprovalConflict as error:
             return failure("conflict", str(error), 409)
@@ -650,6 +749,10 @@ def item(resource, item_id):
     @require_user(roles=write_roles)
     def delete_item():
         try:
+            if resource == "services":
+                service = (record(table, item_id) or [None])[0]
+                if service and _service_in_use(service):
+                    return failure("conflict", "This service is used by projects or certificate templates. Set it to inactive instead.", 409)
             updated = (
                 db().table(table).update({
                     "deleted_at": datetime.now(timezone.utc).isoformat(),
@@ -707,19 +810,25 @@ def upload():
     }[extension]
     related_type, related_id = request.form.get("related_type"), request.form.get("related_id")
     image_type = request.form.get("image_type")
-    if related_type not in {"project", "client", "cleaning_record", "water_testing"} or not related_id:
+    if related_type not in {"project", "client", "cleaning_record", "water_testing", "engineer"} or not related_id:
         return failure("invalid_request", "A valid related_type and related_id are required.", 400)
-    if image_type and (related_type != "project" or image_type not in {"before", "after"}):
+    profile_photo = related_type == "engineer"
+    if profile_photo and (image_type != "profile" or extension not in {"png", "jpg", "jpeg"}):
+        return failure("invalid_request", "Engineer photos must be PNG or JPEG images.", 400)
+    if image_type and not profile_photo and (related_type != "project" or image_type not in {"before", "after"}):
         return failure("invalid_request", "image_type must be before or after for project images.", 400)
-    if g.role == "employee" and (related_type != "project" or extension not in {"png", "jpg", "jpeg"} or image_type not in {"before", "after"}):
-        return failure("forbidden", "Employees may only upload project completion images.", 403)
+    if g.role == "viewer":
+        return failure("forbidden", "Your account has view-only access and cannot upload files.", 403)
+    if g.role == "employee" and not profile_photo and (related_type != "project" or extension not in {"png", "jpg", "jpeg"} or image_type not in {"before", "after"}):
+        return failure("forbidden", "Employees may only upload project completion images and their own photo.", 403)
     try:
         uuid.UUID(related_id)
     except ValueError:
         return failure("invalid_request", "related_id must be a valid record ID.", 400)
-    table = {"project": "projects", "client": "clients", "cleaning_record": "cleaning_records", "water_testing": "water_testing_records"}[related_type]
+    table = {"project": "projects", "client": "clients", "cleaning_record": "cleaning_records", "water_testing": "water_testing_records", "engineer": "engineers"}[related_type]
     storage_path = None
     try:
+        # An employee can only find their own engineer profile, so this is also the "own photo only" check.
         if not record(table, related_id):
             return failure("not_found", "Related record not found.", 404)
         storage_path = f"{g.organization_id}/{related_type}/{related_id}/{uuid.uuid4().hex}-{secure_filename(filename)}"
@@ -735,6 +844,8 @@ def upload():
             "mime_type": content_type, "file_size": len(data), "uploaded_by": g.user.id,
             "image_type": image_type,
         }).execute().data
+        if profile_photo:
+            _retire_old_profile_photos(related_id, metadata[0]["id"])
         return jsonify({"data": metadata[0]}), 201
     except Exception:
         if storage_path:
@@ -849,7 +960,7 @@ def _decide_completion(project_id, approve):
         rows = record("projects", project_id)
         if not rows:
             return failure("not_found", "Project not found.", 404)
-        if rows[0].get("approval_status") != "Submitted for Approval":
+        if rows[0].get("approval_status") not in {"Pending Approval", "Submitted for Approval"}:
             return failure("conflict", "Only completions that are awaiting approval can be approved or rejected.", 409)
         values = {"status": "Completed", "rejection_reason": None} if approve else {"rejection_reason": reason}
         updated = _change_approval(rows[0], "Approved" if approve else "Rejected", "Approved" if approve else "Rejected", values, reason)
@@ -864,7 +975,7 @@ def _decide_completion(project_id, approve):
 @api.get("/approvals")
 @require_user()
 def list_approvals():
-    status = request.args.get("status", "Submitted for Approval")
+    status = request.args.get("status", "Pending Approval")
     if status not in APPROVAL_STATUSES:
         return failure("invalid_request", "Unsupported approval status.", 400)
     try:
@@ -1053,28 +1164,83 @@ def _resolve_project_client(payload):
     payload["client_name"] = name
 
 
-def _completion_values(payload):
-    status = payload.get("completion_status")
-    if status not in {"Completed Early", "Completed Within Contract Period", "Completed Late"}:
-        raise ValueError("Choose a valid completion status.")
+def _completion_values(payload, project):
+    completion_date = payload.get("completion_date")
+    engineer_name = payload.get("completion_engineer_name")
+    invoice_number = payload.get("invoice_number")
+    scheduled_date = project.get("start_date") or project.get("scheduled_date") or project.get("contract_period")
+    if not scheduled_date:
+        raise ValueError("The project must have a scheduled date before completion can be submitted.")
+    try:
+        scheduled = date.fromisoformat(scheduled_date)
+        actual = date.fromisoformat(completion_date)
+    except (TypeError, ValueError):
+        raise ValueError("Enter a valid actual completion date.")
+    payload["completion_status"] = (
+        "Completed Before the Scheduled Date" if actual < scheduled
+        else "Completed After the Scheduled Date" if actual > scheduled
+        else "Completed on the Scheduled Date"
+    )
+    if not isinstance(engineer_name, str) or not engineer_name.strip():
+        raise ValueError("Enter the engineer name.")
+    if not isinstance(invoice_number, str) or not invoice_number.strip():
+        raise ValueError("Enter the invoice number.")
     # The project becomes Completed only when an approver approves the submission.
     payload.pop("status", None)
-    if isinstance(payload.get("invoice_number"), str):
-        payload["invoice_number"] = payload["invoice_number"].strip() or None
-    if status == "Completed Within Contract Period":
-        payload.update({"expected_duration": None, "completed_duration": None, "additional_duration": None})
-    else:
-        expected, completed = payload.get("expected_duration"), payload.get("completed_duration")
-        try:
-            expected, completed = int(expected), int(completed)
-            if expected < 0 or completed < 0:
-                raise ValueError()
-        except (TypeError, ValueError):
-            raise ValueError("Enter valid expected and completed durations in days.")
-        payload["expected_duration"] = expected
-        payload["completed_duration"] = completed
-        payload["additional_duration"] = max(completed - expected, 0)
+    payload["completion_date"] = actual.isoformat()
+    payload["completion_engineer_name"] = engineer_name.strip()
+    payload["invoice_number"] = invoice_number.strip()
     return payload
+
+
+def _retire_old_profile_photos(engineer_id, keep_id):
+    old = scoped_query("uploaded_documents").eq("related_type", "engineer").eq("related_id", engineer_id).execute().data or []
+    upload_root = Path(current_app.config["STORAGE_PATH"]).resolve()
+    for row in old:
+        if row["id"] == keep_id:
+            continue
+        db().table("uploaded_documents").update({"deleted_at": datetime.now(timezone.utc).isoformat(), "updated_by": g.user.id}).eq(
+            "organization_id", g.organization_id
+        ).eq("id", row["id"]).execute()
+        path = (upload_root / row["storage_path"]).resolve()
+        if path.is_relative_to(upload_root):
+            path.unlink(missing_ok=True)
+
+
+def _login_password_problem(password):
+    if g.role != "administrator":
+        return failure("forbidden", "Only administrators can set employee sign-in details.", 403)
+    if not isinstance(password, str) or not 12 <= len(password) <= 512:
+        return failure("invalid_request", "The password must be 12 to 512 characters.", 400)
+    return None
+
+
+def _login_email_taken(email):
+    return sqlalchemy_db.session.execute(select(users.c.id).where(users.c.email == email.strip().lower())).first() is not None
+
+
+def _stage_login(email, full_name, password):
+    """Add an employee user and membership to the open transaction; the caller commits it with the engineer."""
+    user_id, now = str(uuid4()), datetime.now(timezone.utc).isoformat()
+    sqlalchemy_db.session.execute(users.insert().values(
+        id=user_id, email=email.strip().lower(), full_name=str(full_name).strip(),
+        password_hash=generate_password_hash(password), is_active=True, created_at=now, updated_at=now,
+    ))
+    sqlalchemy_db.session.execute(memberships.insert().values(
+        id=str(uuid4()), organization_id=g.organization_id, user_id=user_id, role="employee", status="active", created_at=now,
+    ))
+    return user_id
+
+
+def _stage_password_reset(user_id, password):
+    role = sqlalchemy_db.session.execute(select(memberships.c.role).where(
+        memberships.c.user_id == user_id, memberships.c.organization_id == g.organization_id,
+    )).scalar()
+    if role in ADMIN_LOGIN_ROLES:
+        raise ValueError("Admin-level passwords cannot be changed from the Engineers page.")
+    sqlalchemy_db.session.execute(users.update().where(users.c.id == user_id).values(
+        password_hash=generate_password_hash(password), updated_at=datetime.now(timezone.utc).isoformat(),
+    ))
 
 
 def _engineer_code_taken(payload, engineer_id=None):
@@ -1231,7 +1397,8 @@ def download(file_id):
         files = scoped_query("uploaded_documents").eq("id", file_id).limit(1).execute().data or []
         if not files:
             return failure("not_found", "File not found.", 404)
-        if g.role == "employee" and (
+        # Engineer photos are shown to everyone in the organization; other files follow the project rules.
+        if g.role == "employee" and files[0]["related_type"] != "engineer" and (
             files[0]["related_type"] != "project" or not record("projects", files[0]["related_id"])
         ):
             return failure("not_found", "File not found.", 404)
@@ -1256,7 +1423,7 @@ def list_uploads():
     try:
         query = scoped_query("uploaded_documents")
         if related_type:
-            if related_type not in {"project", "client", "cleaning_record", "water_testing"}:
+            if related_type not in {"project", "client", "cleaning_record", "water_testing", "engineer"}:
                 return failure("invalid_request", "Unsupported related_type.", 400)
         if bool(related_type) != bool(related_id):
             return failure("invalid_request", "related_type and related_id must be provided together.", 400)
@@ -1348,11 +1515,20 @@ def export_report():
                 query = query.eq("engineer_id", request.args["engineer_id"])
         query = in_project_order(query) if table == "projects" else query.order("created_at", desc=True)
         rows = query.limit(5000).execute().data or []
+        schedule = None
+        if resource == "projects":
+            missing = list({row["client_id"] for row in rows if not row.get("client_name") and row.get("client_id")})
+            found = db().table("clients").select("id,name").eq("organization_id", g.organization_id).in_("id", missing).execute().data if missing else []
+            schedule = schedule_rows(rows, {client["id"]: client["name"] for client in found or []})
         fields = [field for field in rows[0] if field not in {"organization_id", "deleted_at"}] if rows else []
         basename = f"watercare-{resource}-report"
         if output_format == "csv":
             output = io.StringIO()
-            if rows:
+            if schedule is not None:
+                writer = csv.writer(output)
+                writer.writerow(SCHEDULE_HEADERS)
+                writer.writerows([[safe_spreadsheet_value(value) for value in line] for line in schedule])
+            elif rows:
                 writer = csv.DictWriter(output, fieldnames=fields, extrasaction="ignore")
                 writer.writeheader()
                 writer.writerows([
@@ -1363,18 +1539,21 @@ def export_report():
             mime, extension = "text/csv", "csv"
         elif output_format == "xlsx":
             from openpyxl import Workbook
-            workbook = Workbook()
-            sheet = workbook.active
-            sheet.title = resource[:31]
-            if fields:
-                sheet.append(fields)
-                for row in rows:
-                    sheet.append([
-                        safe_spreadsheet_value(
-                            str(row.get(field, "")) if isinstance(row.get(field), (dict, list)) else row.get(field)
-                        )
-                        for field in fields
-                    ])
+            if schedule is not None:
+                workbook = schedule_workbook(schedule, safe_spreadsheet_value)
+            else:
+                workbook = Workbook()
+                sheet = workbook.active
+                sheet.title = resource[:31]
+                if fields:
+                    sheet.append(fields)
+                    for row in rows:
+                        sheet.append([
+                            safe_spreadsheet_value(
+                                str(row.get(field, "")) if isinstance(row.get(field), (dict, list)) else row.get(field)
+                            )
+                            for field in fields
+                        ])
             raw = io.BytesIO()
             workbook.save(raw)
             mime, extension = "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet", "xlsx"
@@ -1383,7 +1562,10 @@ def export_report():
             from reportlab.lib.pagesizes import landscape, letter
             from reportlab.platypus import SimpleDocTemplate, Table, TableStyle
             raw = io.BytesIO()
-            data = [fields or ["No records found"]] + [[str(row.get(field, ""))[:200] for field in fields] for row in rows]
+            if schedule is not None:
+                data = [SCHEDULE_HEADERS] + [[str(value)[:200] for value in line] for line in schedule]
+            else:
+                data = [fields or ["No records found"]] + [[str(row.get(field, ""))[:200] for field in fields] for row in rows]
             pdf = SimpleDocTemplate(raw, pagesize=landscape(letter))
             table = Table(data, repeatRows=1)
             table.setStyle(TableStyle([
@@ -1399,3 +1581,237 @@ def export_report():
     except Exception:
         current_app.logger.exception("Report export failed.")
         return failure("database_error", "Report could not be generated.", 503)
+
+DEFAULT_SERVICES = (
+    ("Water testing", "Water quality testing and sampling.", "Water Quality Testing"),
+    ("Tank cleaning", "Cleaning and disinfection of water tanks.", "Domestic Water Tank and Pipeline Network."),
+)
+DEFAULT_VALIDITY_MONTHS = 6
+
+
+def ensure_default_services():
+    """A new company starts with the two original services; after that the Services page owns the list."""
+    if db().table("services").select("id").eq("organization_id", g.organization_id).limit(1).execute().data:
+        return
+    for name, description, certificate_text in DEFAULT_SERVICES:
+        db().table("services").insert({
+            "organization_id": g.organization_id, "name": name, "description": description,
+            "certificate_text": certificate_text, "validity_months": DEFAULT_VALIDITY_MONTHS, "is_active": True,
+            "created_by": g.user.id, "updated_by": g.user.id,
+        }).execute()
+
+
+def _service_by_name(name, active_only=False):
+    query = scoped_query("services").ilike("name", name or "")
+    rows = [row for row in query.limit(20).execute().data or [] if row["name"].lower() == (name or "").lower()]
+    return next((row for row in rows if row.get("is_active") or not active_only), None)
+
+
+def _service_problem(payload, current=None):
+    """Checks for the Services page: name is unique, validity is a sensible number of months."""
+    if "name" in payload:
+        name = (payload["name"] or "").strip()
+        if not name or len(name) > 120:
+            return failure("invalid_request", "Service name must be 1 to 120 characters.", 400)
+        payload["name"] = name
+        duplicate = _service_by_name(name)
+        if duplicate and (not current or duplicate["id"] != current["id"]):
+            return failure("conflict", "A service with this name already exists.", 409)
+    months = payload.get("validity_months")
+    if months is not None and not 1 <= int(months) <= 120:
+        return failure("invalid_request", "Certificate validity must be between 1 and 120 months.", 400)
+    if current is None:
+        payload.setdefault("validity_months", DEFAULT_VALIDITY_MONTHS)
+        payload.setdefault("is_active", True)
+    return None
+
+
+def _project_service_problem(payload, current=None):
+    """A project's service must be one of the company's active services (an unchanged value is always kept)."""
+    if "service" not in payload or (current and payload["service"] == current.get("service")):
+        return None
+    ensure_default_services()
+    if not _service_by_name(payload["service"], active_only=True):
+        return failure("invalid_request", "Choose one of the services set up on the Services page.", 400)
+    return None
+
+
+def _service_in_use(service):
+    projects_using = scoped_query("projects").eq("service", service["name"]).limit(1).execute().data
+    templates_using = scoped_query("certificate_templates").eq("service", service["name"]).limit(1).execute().data
+    return bool(projects_using or templates_using)
+
+
+def _template_row(template_id):
+    try:
+        uuid.UUID(template_id)
+    except ValueError:
+        return None
+    rows = scoped_query("certificate_templates").eq("id", template_id).limit(1).execute().data
+    return rows[0] if rows else None
+
+
+def _template_bytes(row):
+    root = Path(current_app.config["STORAGE_PATH"]).resolve()
+    path = (root / row["storage_path"]).resolve()
+    if not path.is_relative_to(root) or not path.is_file():
+        return None
+    return path.read_bytes()
+
+
+@api.get("/certificate-templates")
+@require_user(EDITORS)
+def list_certificate_templates():
+    rows = scoped_query("certificate_templates").order("created_at", desc=True).limit(200).execute().data or []
+    for row in rows:
+        row.pop("storage_path", None)
+        row.pop("tags", None)
+    return jsonify({"data": rows})
+
+
+@api.post("/certificate-templates")
+@require_user(EDITORS)
+def upload_certificate_template():
+    uploaded = request.files.get("file")
+    if uploaded is None or not uploaded.filename:
+        return failure("invalid_request", "Choose a PowerPoint (.pptx) or Word (.docx) file.", 400)
+    filename = uploaded.filename.replace("\\", "/").split("/")[-1]
+    extension = filename.rsplit(".", 1)[-1].lower() if "." in filename else ""
+    if extension not in certs.EXTENSIONS or len(filename) > 180:
+        return failure("invalid_file", "Only editable PowerPoint (.pptx) or Word (.docx) files are accepted.", 400)
+    ensure_default_services()
+    service = _service_by_name((request.form.get("service") or "").strip(), active_only=True)
+    if not service:
+        return failure("invalid_request", "Choose the certificate type.", 400)
+    data = uploaded.read(15 * 1024 * 1024 + 1)
+    if len(data) > 15 * 1024 * 1024:
+        return failure("file_too_large", "Template exceeds 15 MB.", 413)
+    if not data or not certs.check_template(data, extension):
+        return failure("invalid_file", f"That file is not a valid .{extension} document.", 400)
+    name = (request.form.get("name") or filename.rsplit(".", 1)[0]).strip()[:200]
+    storage_path = f"{g.organization_id}/certificate-templates/{uuid.uuid4().hex}-{secure_filename(filename)}"
+    root = Path(current_app.config["STORAGE_PATH"]).resolve()
+    destination = (root / storage_path).resolve()
+    if not destination.is_relative_to(root):
+        return failure("invalid_request", "Invalid upload destination.", 400)
+    try:
+        destination.parent.mkdir(parents=True, exist_ok=True)
+        destination.write_bytes(data)
+        row = db().table("certificate_templates").insert({
+            "organization_id": g.organization_id, "name": name, "service": service["name"],
+            "original_filename": filename, "file_type": extension, "storage_path": storage_path,
+            "file_size": len(data), "tags": certs.template_tags(data, extension),
+            "created_by": g.user.id, "updated_by": g.user.id,
+        }).execute().data[0]
+    except Exception:
+        destination.unlink(missing_ok=True)
+        current_app.logger.exception("Certificate template upload failed.")
+        return failure("storage_error", "The template could not be saved.", 503)
+    row.pop("storage_path", None)
+    row.pop("tags", None)
+    return jsonify({"data": row}), 201
+
+
+@api.delete("/certificate-templates/<template_id>")
+@require_user(EDITORS)
+def delete_certificate_template(template_id):
+    row = _template_row(template_id)
+    if not row:
+        return failure("not_found", "Template not found.", 404)
+    db().table("certificate_templates").update({
+        "deleted_at": datetime.now(timezone.utc).isoformat(), "updated_by": g.user.id,
+    }).eq("organization_id", g.organization_id).eq("id", template_id).execute()
+    root = Path(current_app.config["STORAGE_PATH"]).resolve()
+    (root / row["storage_path"]).resolve().unlink(missing_ok=True)
+    return jsonify({"message": "Template deleted."})
+
+
+@api.get("/projects/<project_id>/certificate")
+@require_user()
+def project_certificate(project_id):
+    """The client's Download certificate button: filled from the saved template for the project's service."""
+    try:
+        uuid.UUID(project_id)
+    except ValueError:
+        return failure("invalid_request", "Project ID must be a valid UUID.", 400)
+    found = record("projects", project_id)
+    if not found:
+        return failure("not_found", "Project not found.", 404)
+    project = found[0]
+    if project.get("approval_status") != "Approved":
+        return failure("conflict", "The certificate is available once the admin approves the work completion.", 409)
+    ensure_default_services()
+    service = _service_by_name(project.get("service")) or {}
+    templates = scoped_query("certificate_templates").eq("service", project.get("service")).order(
+        "created_at", desc=True
+    ).limit(1).execute().data
+    if not templates:
+        return failure("not_found", f"No certificate template is saved for {project.get('service')} yet. Please contact the admin.", 404)
+    template = templates[0]
+    data = _template_bytes(template)
+    if data is None:
+        return failure("not_found", "The certificate template file is missing. Please contact the admin.", 404)
+    try:
+        completed = date.fromisoformat(str(project.get("completion_date") or "")[:10])
+    except ValueError:
+        completed = date.today()
+    expiry = certs.add_months(completed, service.get("validity_months") or DEFAULT_VALIDITY_MONTHS)
+    client_name = project.get("client_name")
+    if not client_name and project.get("client_id"):
+        client_rows = db().table("clients").select("name").eq("organization_id", g.organization_id).eq("id", project["client_id"]).execute().data
+        client_name = client_rows[0]["name"] if client_rows else ""
+    start, end = month_year(project.get("start_date")), month_year(project.get("end_date"))
+    values = {
+        "client_name": client_name or "", "project_name": project.get("name") or "", "location": project.get("location") or "",
+        "service_text": service.get("certificate_text") or certs.DEFAULT_SERVICE_TEXT, "reference": "",
+        "completion_date": certs.display_date(completed), "expiry_date": certs.display_date(expiry),
+        "so_number": "" if project.get("so_no") is None else project["so_no"],
+        "contract_period": f"{start} to {end}" if start and end and start != end else start or end,
+        "engineer_name": project.get("completion_engineer_name") or project.get("engineer_name") or "",
+        "invoice_number": project.get("invoice_number") or "", "issue_date": certs.display_date(date.today()),
+    }
+    try:
+        filled = certs.fill_template(data, template["file_type"], values)
+    except Exception:
+        current_app.logger.exception("Certificate generation failed.")
+        return failure("generation_failed", "The certificate could not be generated from the saved template.", 500)
+    try:
+        pdf = convert_to_pdf(filled, template["file_type"])
+    except PdfUnavailable:
+        current_app.logger.exception("Certificate PDF conversion failed.")
+        return failure("pdf_unavailable", "The PDF could not be created on this server. Please contact the admin.", 503)
+    label = secure_filename(f"certificate-{values['project_name']}") or "certificate"
+    return send_file(io.BytesIO(pdf), mimetype="application/pdf", as_attachment=True, download_name=f"{label}.pdf")
+
+
+SAMPLE_CERTIFICATE_VALUES = {
+    "client_name": "Sample Client LLC", "project_name": "Sample Project - 01", "location": "Sample Building, Dubai, UAE",
+    "service_text": "Domestic Water Tank and Pipeline Network.", "reference": "", "so_number": "1001",
+    "contract_period": "January 2026 to December 2026", "engineer_name": "Sample Engineer", "invoice_number": "INV-0001",
+}
+
+
+@api.get("/certificate-templates/<template_id>/preview")
+@require_user(EDITORS)
+def preview_certificate_template(template_id):
+    """The saved template filled with sample data, as a PDF to look at before real certificates use it."""
+    row = _template_row(template_id)
+    if not row:
+        return failure("not_found", "Template not found.", 404)
+    data = _template_bytes(row)
+    if data is None:
+        return failure("not_found", "The template file is missing. Upload it again.", 404)
+    today = date.today()
+    values = {
+        **SAMPLE_CERTIFICATE_VALUES, "completion_date": certs.display_date(today),
+        "expiry_date": certs.display_date(certs.add_months(today, DEFAULT_VALIDITY_MONTHS)), "issue_date": certs.display_date(today),
+    }
+    try:
+        pdf = convert_to_pdf(certs.fill_template(data, row["file_type"], values), row["file_type"])
+    except PdfUnavailable:
+        current_app.logger.exception("Certificate preview conversion failed.")
+        return failure("pdf_unavailable", "The preview could not be created on this server.", 503)
+    except Exception:
+        current_app.logger.exception("Certificate preview failed.")
+        return failure("generation_failed", "The preview could not be created from this template.", 500)
+    return send_file(io.BytesIO(pdf), mimetype="application/pdf", download_name="template-preview.pdf")

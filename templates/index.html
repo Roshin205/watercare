@@ -10,26 +10,28 @@
   <link rel="stylesheet" href="https://unpkg.com/maplibre-gl@5.24.0/dist/maplibre-gl.css" integrity="sha384-uTttxo/aOKbdE5RlD/SPzSDoDmNvGlUYPjONi2MN/b7c9HPSvW07OIuyP7uL6jxK" crossorigin="">
   <link rel="stylesheet" href="https://unpkg.com/leaflet.markercluster@1.5.3/dist/MarkerCluster.css" integrity="sha384-pmjIAcz2bAn0xukfxADbZIb3t8oRT9Sv0rvO+BR5Csr6Dhqq+nZs59P0pPKQJkEV" crossorigin="">
   <link rel="stylesheet" href="{{ url_for('static', filename='css/app.css') }}">
+  <link rel="stylesheet" href="{{ url_for('static', filename='css/enhancements.css') }}">
 </head>
 <body>
   <section id="login" class="login-screen">
     <div class="login-card"><div class="brand-mark">ماء</div><p class="eyebrow">WATER TESTING & TANK CARE</p><h1>Welcome to WaterCare</h1>
-      <p class="muted">Sign in with your authorized employee account.</p>
-      <form id="login-form"><label>Email<input name="email" type="email" autocomplete="username" required></label><label>Password<input name="password" type="password" autocomplete="current-password" required></label><button class="primary">Sign in</button></form>
+      <div class="login-tabs" role="tablist" aria-label="Login type"><button type="button" role="tab" id="tab-admin" data-login-type="admin" aria-selected="true" class="active">Admin login</button><button type="button" role="tab" id="tab-client" data-login-type="client" aria-selected="false">Client login</button></div>
+      <p id="login-hint" class="muted">Admin login needs your email, password and private key.</p>
+      <form id="login-form"><label>Email<input name="email" type="email" autocomplete="username" required></label><label>Password<input name="password" type="password" autocomplete="current-password" required></label><label id="key-field">Private key<input name="access_key" type="password" autocomplete="off" required></label><button class="primary">Sign in</button></form>
       <button id="forgot" class="text-button">Forgot password?</button><p id="login-message" role="status"></p>
     </div>
   </section>
   <div id="app" class="layout hidden">
     <aside class="sidebar"><a class="brand" href="#" data-page="Dashboard"><span class="brand-mark">ماء</span><span><b>WaterCare</b><small>Care in every drop</small></span></a>
       <nav id="navigation">
-        <button data-page="Dashboard" class="active">◈ <span>Dashboard</span></button><button data-page="Projects">▦ <span>Projects</span></button><button data-action="add-project">＋ <span>Add Project</span></button><button data-page="Cleaning Records">⌁ <span>Cleaning Records</span></button><button data-action="add-record">＋ <span>Add Record</span></button><button data-page="Water Testing">◉ <span>Water Testing</span></button><button data-page="Clients">♧ <span>Clients</span></button><button data-page="Engineers">♙ <span>Engineers</span></button><button data-page="Approvals">✓ <span>Approvals</span></button><button data-page="Reports">▤ <span>Reports</span></button><button data-page="Settings">⚙ <span>Settings</span></button>
+        <button data-page="Dashboard" class="active">◈ <span>Dashboard</span></button><button data-page="Projects">▦ <span>Projects</span></button><button data-action="add-project">＋ <span>Add Project</span></button><button data-page="Clients">♧ <span>Clients</span></button><button data-page="Services">❖ <span>Services</span></button><button data-page="Engineers">♙ <span>Engineers</span></button><button data-page="Approvals">✓ <span>Approvals</span></button><button data-page="Certificates">✦ <span>Certificates</span></button><button data-page="Reports">▤ <span>Reports</span></button><button data-page="Settings">⚙ <span>Settings</span></button>
       </nav><div class="side-bottom"><span id="user-email"></span><button id="logout" class="logout">Log out</button></div>
     </aside>
     <main class="main"><header><div><p class="eyebrow">WATERCARE OPERATIONS</p><h1 id="page-title">Dashboard</h1></div><div class="header-actions"><button id="clients-link" class="outline">Clients</button><button id="add-record" class="primary">＋ Add record</button></div></header>
       <section id="filter-bar" class="filter-bar" aria-label="Filter records">
         <input id="search-filter" class="filter-search" type="search" placeholder="Search by name, site, engineer, SO no…" aria-label="Search" autocomplete="off">
         <select id="client-filter" data-filter="client" aria-label="Filter by client"><option value="">All clients</option></select>
-        <select id="project-filter" data-filter="project" aria-label="Filter by project"><option value="">All projects</option></select>
+        <select id="project-filter" data-filter="project" aria-label="Filter by project type"><option value="">All project types</option></select>
         <label data-filter="day">Date<input id="date-filter" type="date" aria-label="Show work for one date"></label>
         <button id="all-dates" data-filter="day" class="outline" type="button">All dates</button>
         <button id="today" data-filter="day" class="outline" type="button">Today</button>
@@ -39,36 +41,73 @@
       </section>
       <section id="notice" class="notice hidden" role="status"></section>
       <section id="dashboard" class="dashboard-grid">
+        <article id="assigned-panel" class="panel assigned-panel hidden"><div class="panel-heading"><div><p class="eyebrow">YOUR JOBS</p><h2>Work assigned to you</h2></div><span id="assigned-count" class="position"></span></div><p class="muted assigned-intro">Jobs added for you on the Engineers page. Press Go to location to see the site on the map.</p><div id="assigned-list" class="assigned-list"></div><div id="assigned-map-slot" class="assigned-map-slot"></div></article>
         <article class="panel overview"><div class="panel-heading"><div><p class="eyebrow">SCHEDULED WORK</p><h2>Project Overview</h2></div><div class="panel-tools"><button id="reset-order-dashboard" class="text-button reset-order hidden" type="button">Reset to date order</button><span id="task-position" class="position">0 items</span></div></div><p id="task-count" class="task-count">No tasks scheduled</p><div id="task-list" class="task-list"><p class="empty">Select a date to see scheduled work.</p></div></article>
-        <article class="panel calendar-panel"><div class="panel-heading"><button id="previous-month" aria-label="Previous month">←</button><div><p class="eyebrow">SCHEDULE</p><h2 id="month-label"></h2></div><button id="next-month" aria-label="Next month">→</button></div><div class="calendar-grid" id="calendar"></div></article>
+        <article class="panel calendar-panel"><div class="panel-heading"><button id="previous-month" aria-label="Previous month">←</button><div><p class="eyebrow">SCHEDULE</p><h2 id="month-label"></h2><p id="calendar-help" class="calendar-help">Project periods are marked on each day. Drag a project card onto a date to schedule it.</p></div><button id="next-month" aria-label="Next month">→</button></div><div class="calendar-grid" id="calendar"></div></article>
         <article class="panel map-panel"><div class="panel-heading"><div><p class="eyebrow">SITE LOCATIONS</p><h2>Project Map</h2></div><span id="map-count" class="position">0 located projects</span></div><div id="project-map" class="project-map" role="region" aria-label="Map of project locations"></div><div id="map-legend" class="map-legend" aria-label="Pin colours by approval status"></div><p id="map-message" class="muted map-message"></p></article>
       </section>
       <section id="approvals" class="hidden">
-        <article class="panel"><div class="panel-heading"><div><p class="eyebrow">COMPLETION REVIEW</p><h2>Awaiting Approval</h2></div><span id="approval-count" class="position"></span></div><div class="table-wrap"><table><thead><tr><th>Client</th><th>Project</th><th>Engineer</th><th>Completion</th><th>Invoice No.</th><th>Actions</th></tr></thead><tbody id="approval-body"></tbody></table></div></article>
+        <article class="panel"><div class="panel-heading"><div><p class="eyebrow">COMPLETION REVIEW</p><h2>Awaiting Approval</h2></div><span id="approval-count" class="position"></span></div><div class="table-wrap"><table><thead><tr><th>Client</th><th>Project</th><th>Engineer</th><th>Actual completion date</th><th>Completion timing</th><th>Invoice No.</th><th>Actions</th></tr></thead><tbody id="approval-body"></tbody></table></div></article>
         <article class="panel history-panel"><div class="panel-heading"><div><p class="eyebrow">AUDIT TRAIL</p><h2>Approval History</h2></div></div><div class="table-wrap"><table><thead><tr><th>Date &amp; time</th><th>Task / project</th><th>Status change</th><th>Action</th><th>By</th><th>Rejection reason</th></tr></thead><tbody id="history-body"></tbody></table></div></article>
       </section>
       <section id="records" class="panel hidden"><div class="panel-heading"><div><p class="eyebrow">BUSINESS RECORDS</p><h2 id="records-title"></h2></div><div class="panel-tools"><button id="reset-order" class="text-button reset-order hidden" type="button">Reset to date order</button><span id="records-count" class="position"></span></div></div><div class="table-wrap"><table><thead id="table-head"></thead><tbody id="table-body"></tbody></table></div></section>
     </main>
   </div>
   <dialog id="record-dialog"><form id="record-form"><div class="panel-heading"><h2 id="form-title">Add record</h2><button type="button" id="close-dialog" class="icon-button" aria-label="Close">×</button></div><div id="form-fields" class="form-grid"></div><p id="form-message" role="alert"></p><button class="primary">Save record</button></form></dialog>
+  <dialog id="schedule-dialog" class="schedule-dialog"><form id="schedule-form">
+    <div class="panel-heading"><div><p class="eyebrow">PROJECT SCHEDULE</p><h2 id="schedule-title">Schedule project</h2></div><button type="button" id="close-schedule-dialog" class="icon-button" aria-label="Close">×</button></div>
+    <p id="schedule-project-name" class="schedule-project-name"></p>
+    <fieldset class="schedule-mode"><legend>Is this a single date or a date range?</legend>
+      <label><input type="radio" name="schedule-mode" value="single" checked> Single date</label>
+      <label><input type="radio" name="schedule-mode" value="range"> Date range</label>
+    </fieldset>
+    <div class="schedule-date-fields">
+      <label>From<input id="schedule-start" type="date" required></label>
+      <label id="schedule-end-field" class="hidden">To<input id="schedule-end" type="date"></label>
+    </div>
+    <p id="schedule-instruction" class="muted schedule-instruction">Choose the project date on the calendar.</p>
+    <div class="schedule-calendar-heading"><button id="schedule-previous-month" type="button" class="outline" aria-label="Previous month">←</button><strong id="schedule-month-label"></strong><button id="schedule-next-month" type="button" class="outline" aria-label="Next month">→</button></div>
+    <div id="schedule-calendar" class="calendar-grid schedule-calendar"></div>
+    <p id="schedule-message" role="alert"></p>
+    <div class="schedule-actions"><button type="button" id="cancel-schedule" class="outline">Cancel</button><button type="submit" class="primary">Save schedule</button></div>
+  </form></dialog>
   <dialog id="completion-dialog"><form id="completion-form">
-    <div class="panel-heading"><h2 id="completion-title">Mark Project as Completed</h2><button type="button" id="close-completion-dialog" class="icon-button" aria-label="Close">×</button></div>
+    <div class="panel-heading"><h2 id="completion-title">Work Completion &amp; Approval Form</h2><button type="button" id="close-completion-dialog" class="icon-button" aria-label="Close">×</button></div>
     <input id="completion-project-id" type="hidden">
-    <label>Completion Status<select id="completion-status" required><option value="">Choose status</option><option>Completed Early</option><option>Completed Within Contract Period</option><option>Completed Late</option></select></label>
-    <div id="completion-duration-fields" class="form-grid hidden">
-      <label>Expected Duration (days)<input id="expected-duration" type="number" min="0" step="1"></label>
-      <label>Completed Duration (days)<input id="completed-duration" type="number" min="0" step="1"></label>
-    </div>
-    <p id="additional-duration" role="status"></p>
-    <label>Invoice Number<input id="invoice-number" maxlength="100" autocomplete="off"></label>
+    <section class="completion-section">
+      <h3>1. Project Details</h3>
+      <p>Client: <strong id="completion-client-name"></strong></p>
+      <p>Project: <strong id="completion-project-name"></strong></p>
+      <p>Scheduled date: <strong id="completion-scheduled-date"></strong></p>
+      <div class="form-grid">
+        <label>Invoice No.<input id="invoice-number" maxlength="100" autocomplete="off" required></label>
+        <label>Engineer Name<input id="completion-engineer-name" maxlength="320" autocomplete="name" required></label>
+      </div>
+    </section>
+    <section class="completion-section">
+      <h3>2. Work Completion Photos</h3>
+      <div id="completion-image-inputs" class="form-grid">
+        <label>Before Image<input id="before-images" type="file" accept="image/png,image/jpeg" multiple required></label>
+        <label>After Image<input id="after-images" type="file" accept="image/png,image/jpeg" multiple required></label>
+      </div>
+    </section>
+    <section class="completion-section">
+      <h3>3. Work Completion Date</h3>
+      <label>Actual completion date<input id="completion-date" type="date" required></label>
+      <p id="completion-date-help" class="muted">Select the date the work was completed.</p>
+      <p>Completion category: <strong id="completion-category">Choose an actual completion date</strong></p>
+    </section>
     <div id="completion-approval" class="approval-summary hidden"></div>
-    <div id="completion-image-inputs" class="form-grid">
-      <label class="wide">Before Images<input id="before-images" type="file" accept="image/png,image/jpeg" multiple required></label>
-      <label class="wide">After Images<input id="after-images" type="file" accept="image/png,image/jpeg" multiple required></label>
-    </div>
     <div id="saved-project-images" class="project-images"></div>
     <div id="completion-history" class="completion-history"></div>
     <p id="completion-message" role="alert"></p><button id="completion-submit" class="primary">Submit for Approval</button>
+  </form></dialog>
+  <dialog id="approve-dialog" class="approval-confirm-dialog" aria-labelledby="approve-title"><form id="approve-form">
+    <div class="panel-heading"><h2 id="approve-title">Approve completion?</h2><button type="button" id="close-approve-dialog" class="icon-button" aria-label="Close">×</button></div>
+    <p id="approve-reference" class="muted"></p>
+    <p>This will mark the project as completed and record your approval.</p>
+    <p id="approve-message" role="alert"></p>
+    <div class="schedule-actions"><button type="button" id="cancel-approve" class="outline">Cancel</button><button id="confirm-approve" type="submit" class="primary">Approve completion</button></div>
   </form></dialog>
   <dialog id="reject-dialog"><form id="reject-form">
     <div class="panel-heading"><h2>Reject Completion</h2><button type="button" id="close-reject-dialog" class="icon-button" aria-label="Close">×</button></div>
@@ -81,7 +120,7 @@
   <script src="https://unpkg.com/@maplibre/maplibre-gl-leaflet@0.1.4/leaflet-maplibre-gl.js" integrity="sha384-tXYNKOHx4T02jMP7YYCtBxPIv1B5gaA5mcVPBzqMp6d7VzWzxJgI2aWF/nJLrQdS" crossorigin="" defer></script>
   <script src="https://unpkg.com/leaflet.markercluster@1.5.3/dist/leaflet.markercluster.js" integrity="sha384-eXVCORTRlv4FUUgS/xmOyr66XBVraen8ATNLMESp92FKXLAMiKkerixTiBvXriZr" crossorigin="" defer></script>
   <script src="{{ url_for('static', filename='js/json-fields.js') }}" defer></script>
-  <script src="{{ url_for('static', filename='js/place-search.js') }}" defer></script>
-  <script src="{{ url_for('static', filename='js/app.js') }}" defer></script>
+  <script src="{{ url_for('static', filename='js/place-search.js', v='202610300025') }}" defer></script>
+  <script src="{{ url_for('static', filename='js/app.js', v='202610300025') }}" defer></script>
 </body>
 </html>

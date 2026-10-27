@@ -43,6 +43,8 @@ Revision `202610260006` adds Engineer IDs (unique per organization), custom sche
 
 Revision `202610270007` adds the project priority date and rank used to persist manual work-order changes. It adds columns only; existing projects remain in date order until someone reorders them.
 
+Revision `202610280008` adds the actual completion date and completion engineer name. It maps existing completion timing and awaiting-approval values to the current form labels while preserving project and approval history data. Run `flask --app main:app db upgrade` to apply it before using the updated completion form.
+
 ## Authentication and access control
 
 Flask stores authenticated employee identity in a signed, HTTP-only session cookie. Mutating API requests also require the session CSRF token. The server reloads the account and active organization membership for each request and enforces role permissions and organization scoping on every API call; the interface only hides controls a role cannot use.
@@ -55,15 +57,34 @@ Flask stores authenticated employee identity in a signed, HTTP-only session cook
 | Employee | View-only for work assigned to their engineer profile; may submit a completion (with invoice number and before/after photos) for an assigned project |
 | Viewer | View-only for all organization records |
 
-A completion submission sets the project's approval status to **Submitted for Approval**. A Service Coordinator, Accountant, or Administrator then approves it (the project becomes **Approved** and **Completed**) or rejects it with a reason (**Rejected**; the submitter can correct and resubmit). Every change is recorded in `approval_history` with the project reference, previous and new status, action, who acted, when, and any rejection reason; the Approvals page lists submissions awaiting a decision and the full history.
+A worker submits the Work Completion & Approval Form against the existing project. Client, project, and scheduled-date details are prefilled; the worker enters the invoice number and completion engineer, uploads before- and after-work photos, and selects the actual completion date. The form displays whether completion was before, on, or after the scheduled date, and the server independently derives and saves that category from the two dates. Submissions are marked **Pending Approval** and shown to Service Coordinators, Accountants, and Administrators with the completion details and photos. An approver can approve (the project becomes **Approved** and **Completed**) or reject with a reason (**Rejected**; the worker can correct and resubmit). Every status change is recorded in `approval_history`.
 
 There is no public registration route. Create accounts only for authorized employees. For a password reset, verify the employee through the organization’s normal process and run the `set-password` CLI command on the deployed service or from a trusted operator environment.
 
 ## Project work order and filters
 
-The Projects page and dashboard list projects by scheduled date, with a bold date heading for each group. Service Coordinators, Accountants, and Administrators can drag a project's handle to reorder work within or across dates; touch dragging and keyboard arrow keys are supported as well. The shared order is saved in the database. If a project is rescheduled, it returns to its new date group. Use **Reset to date order** to clear manual ordering and restore the scheduled-date order.
+The Projects page and dashboard list projects by scheduled date, with a bold date heading for each group. Service Coordinators, Accountants, and Administrators can drag a project's handle to reorder work within or across dates; touch dragging and keyboard arrow keys are supported as well. On the dashboard, drag a project card onto a calendar day to schedule or reschedule it. Choose a single day or a range; range dates can be picked on the calendar or entered directly, and every covered day shows the project. The shared order and schedule are saved in the database. If a project is rescheduled, it returns to its new date group. Use **Reset to date order** to clear manual ordering and restore the scheduled-date order.
 
-The dashboard starts with all projects. Choose a calendar day or use the date field to show work for one day; **All dates** returns to the full list. List pages provide search, client, project, and date-range filters. Search checks project and client names, sites, engineer names, and SO numbers. Report downloads and the dashboard map use the active filters too. The dashboard filter uses one date rather than a date range, and includes **Today** and **All dates** shortcuts.
+The dashboard starts with all projects. Choose a calendar day or use the date field to show work for one day; **All dates** returns to the full list. List pages provide search, client, project, and date-range filters. Search checks project and client names, sites, engineer names, and SO numbers. Report downloads and the dashboard map use the active filters too. The dashboard filter uses one date rather than a date range, and includes **Today** and **All dates** shortcuts. Interface transitions and hover effects are lightweight and respect the device's reduced-motion preference.
+
+## Sign-in: Admin login and Client login
+
+The sign-in page has two tabs:
+
+- **Admin login** (administrators, service coordinators and accountants): email, password **and a private key**. The key is stored only as a hash in the `users.access_key_hash` column and is never shown again. Accounts without a key cannot use the Admin login.
+- **Client login** (employees and viewers): email and password only. Admin-level accounts are refused here and told to use the Admin login, and the reverse.
+
+Set or change a key from the command line (it prompts, so the key never appears in shell history):
+
+```bash
+flask --app main:app set-admin-key --email you@example.com
+```
+
+`create-admin` now asks for the key too. Administrators create admin-level accounts through `POST /api/auth/users` with an `access_key` of at least 12 characters.
+
+**Employee logins** are created by administrators on the Engineers page: enter the Engineer ID, name, the Gmail used to sign in and a login password (12+ characters). Editing the engineer with a new password resets it. Only administrators can see or use the password field.
+
+**What each role sees:** employees can sign in, mark their assigned work as completed from the dashboard (everything else is view-only), view the Projects page without edit buttons, and move and zoom the map freely. They never see the Approvals page; only administrators, service coordinators and accountants approve or reject. Administrators and coordinators also get a small "Tap to know the location" button on each dashboard project that opens its place on the map.
 
 ## Documents
 
@@ -98,3 +119,18 @@ If usage grows beyond those policies, switch the tile URL in `static/js/app.js` 
 ## GitHub safety
 
 Never commit `.env`, database URLs, passwords, or session keys. The `.gitignore` excludes local secret/configuration files, SQLite databases, uploads, and Python build artifacts. Previously disclosed credentials must be revoked and replaced before deployment. If any credential-bearing revision is already in Git history, do not push that history; publish only a clean, sanitized source history after rotating the exposed credentials.
+
+## Services and certificates
+
+The **Services** page (administrators) lists the services the company offers. Water testing and Tank cleaning are
+there to start with; each service has a certificate wording and a validity in months. Project forms, filters and
+certificates all use this list.
+
+The **Certificates** page (administrator, service coordinator, accountant) keeps one editable PowerPoint (.pptx) or Word
+(.docx) template per certificate type (a service). In the template, type tags where data should go:
+`{{client_name}}`, `{{project_name}}`, `{{location}}`, `{{service_text}}`, `{{reference}}`, `{{completion_date}}`,
+`{{expiry_date}}`, `{{so_number}}`, `{{contract_period}}`, `{{engineer_name}}`, `{{invoice_number}}` and `{{issue_date}}`.
+Once an engineer's completion is approved, everyone who can see that project gets a **Download certificate** button that
+fills the newest template for the project's service and downloads it as a PDF. Fonts are kept as in the template and no
+text is bold. The PDF is made by LibreOffice (install it on the server and make sure `soffice` is on PATH) or, on a Windows
+computer, by Microsoft PowerPoint/Word; without either the download shows an error.
