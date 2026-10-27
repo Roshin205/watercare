@@ -420,8 +420,10 @@
     else if (page === "Reports") renderReports();
     else if (page === "Settings") renderSettings();
     else if (page === "Certificates") renderCertificates();
+    syncMobileTabs(); updateFilterToggle();
   }
   function applyFilters() {
+    updateFilterToggle();
     if (page === "Dashboard") refreshDashboard();
     else if (resources[page]) loadRecords();
     else if (page === "Approvals") renderApprovalTables();
@@ -1387,10 +1389,46 @@
   $("#navigation").onclick = event => {
     const action = event.target.closest("[data-action]");
     const button = event.target.closest("[data-page]");
+    if (action || button) setNavOpen(false);
     if (action) {
       navigate("Projects");
       openForm();
     } else if (button) navigate(button.dataset.page);
+  };
+  // Phones: the sidebar slides in from the left, and a tab bar at the bottom mirrors the most used pages.
+  function setNavOpen(open) {
+    document.body.classList.toggle("nav-open", open);
+    $("#nav-toggle").setAttribute("aria-expanded", String(open));
+    $("#nav-backdrop").hidden = !open;
+  }
+  function syncMobileTabs() {
+    $("#mobile-title").textContent = page;
+    $("#mobile-tabs").querySelectorAll("[data-tab-page], [data-tab-action]").forEach(tab => {
+      const source = tab.dataset.tabPage
+        ? $(`#navigation [data-page="${tab.dataset.tabPage}"]`) : $(`#navigation [data-action="${tab.dataset.tabAction}"]`);
+      tab.classList.toggle("hidden", !source || source.classList.contains("hidden"));
+      tab.classList.toggle("active", tab.dataset.tabPage === page);
+    });
+  }
+  $("#nav-toggle").onclick = () => setNavOpen(!document.body.classList.contains("nav-open"));
+  $("#nav-backdrop").onclick = () => setNavOpen(false);
+  document.addEventListener("keydown", event => { if (event.key === "Escape") setNavOpen(false); });
+  $("#mobile-tabs").onclick = event => {
+    const tab = event.target.closest("button");
+    if (!tab) return;
+    if ("tabMenu" in tab.dataset) { setNavOpen(true); return; }
+    const source = tab.dataset.tabPage ? $(`#navigation [data-page="${tab.dataset.tabPage}"]`) : $(`#navigation [data-action="${tab.dataset.tabAction}"]`);
+    source?.click();
+  };
+  function updateFilterToggle() {
+    const values = filterValues(), kinds = PAGE_FILTERS[page] || [];
+    const count = [kinds.includes("client") && values.client, kinds.includes("project") && values.project,
+      kinds.includes("day") && $("#date-filter").value, kinds.includes("range") && values.from, kinds.includes("range") && values.to].filter(Boolean).length;
+    $("#filter-toggle").textContent = count ? `Filters (${count})` : "Filters";
+  }
+  $("#filter-toggle").onclick = () => {
+    const open = $("#filter-bar").classList.toggle("filters-open");
+    $("#filter-toggle").setAttribute("aria-expanded", String(open));
   };
   $("#today").onclick = () => selectDay(isoDate(new Date()));
   $("#all-dates").onclick = showAllDates;
@@ -1512,7 +1550,26 @@
       input.before(wrap); wrap.append(input, button);
     });
   }
+  // On phones each table row becomes a card, so every cell carries its column name to show beside the value.
+  function labelTableCells() {
+    document.querySelectorAll("table").forEach(table => {
+      const heads = [...table.querySelectorAll("thead th")].map(th => th.textContent.trim());
+      table.querySelectorAll("tbody tr").forEach(row => {
+        let column = 0;
+        [...row.children].forEach(cell => {
+          if (cell.tagName === "TD" && !cell.hasAttribute("data-label")) cell.dataset.label = cell.colSpan > 1 ? "" : heads[column] || "";
+          column += cell.colSpan || 1;
+        });
+      });
+    });
+  }
+  let domWorkPending = false;
+  const afterDomChange = () => {
+    if (domWorkPending) return;
+    domWorkPending = true;
+    setTimeout(() => { domWorkPending = false; addPasswordToggles(); labelTableCells(); }, 0);
+  };
   addPasswordToggles();
-  new MutationObserver(() => addPasswordToggles()).observe(document.body, { childList: true, subtree: true });
+  new MutationObserver(afterDomChange).observe(document.body, { childList: true, subtree: true });
   initialize();
 })();
