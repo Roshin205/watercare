@@ -27,8 +27,12 @@ def create_app(config_object=Config):
         missing = [key for key in ("SECRET_KEY", "DATABASE_URL") if not os.environ.get(key)]
         if missing:
             raise RuntimeError("Missing required deployment configuration: " + ", ".join(missing))
-        if not os.path.isabs(app.config["STORAGE_PATH"]):
-            raise RuntimeError("STORAGE_PATH must be an absolute path on a Render persistent disk.")
+        cloud_files = all(app.config.get(key) for key in ("SUPABASE_URL", "SUPABASE_SECRET_KEY", "SUPABASE_BUCKET"))
+        if not cloud_files and not os.path.isabs(app.config["STORAGE_PATH"]):
+            raise RuntimeError(
+                "Set SUPABASE_URL, SUPABASE_SECRET_KEY and SUPABASE_BUCKET for cloud files, "
+                "or STORAGE_PATH to an absolute path on a persistent disk."
+            )
 
     logging.basicConfig(
         level=os.environ.get("LOG_LEVEL", "INFO").upper(),
@@ -101,6 +105,66 @@ def create_app(config_object=Config):
                 role="administrator", status="active", created_at=now,
             ))
         click.echo("Administrator account created.")
+
+    @app.cli.command("ensure-admin")
+    def ensure_admin():
+        """Create or update the administrator named by ADMIN_EMAIL, ADMIN_PASSWORD and ADMIN_ACCESS_KEY.
+
+        Runs on every start of the deployed app, so the admin login always matches the host's settings.
+        Missing or invalid settings only print a warning; the app still starts.
+        """
+        from backend.database import db
+        from backend.models import memberships, organizations, users
+
+        email = os.environ.get("ADMIN_EMAIL", "").strip().lower()
+        password = os.environ.get("ADMIN_PASSWORD", "")
+        access_key = os.environ.get("ADMIN_ACCESS_KEY", "")
+        if not (email or password or access_key):
+            click.echo("ensure-admin: ADMIN_EMAIL, ADMIN_PASSWORD and ADMIN_ACCESS_KEY are not set; skipped.")
+            return
+        problems = []
+        if not re.fullmatch(r"[^@\s]+@[^@\s]+\.[^@\s]+", email):
+            problems.append("ADMIN_EMAIL is not a valid email")
+        if not 12 <= len(password) <= 512:
+            problems.append("ADMIN_PASSWORD must be 12 to 512 characters")
+        if not 12 <= len(access_key) <= 512:
+            problems.append("ADMIN_ACCESS_KEY must be 12 to 512 characters")
+        if problems:
+            click.echo("ensure-admin: skipped, " + "; ".join(problems) + ".")
+            return
+        now = datetime.now(timezone.utc).isoformat()
+        hashes = {"password_hash": generate_password_hash(password), "access_key_hash": generate_password_hash(access_key)}
+        with db.engine.begin() as connection:
+            existing = connection.execute(db.select(users.c.id).where(users.c.email == email)).first()
+            if existing:
+                role = connection.execute(db.select(memberships.c.role).where(memberships.c.user_id == existing.id)).scalar()
+                if role != "administrator":
+                    click.echo("ensure-admin: that email belongs to a non-administrator account; nothing changed.")
+                    return
+                connection.execute(users.update().where(users.c.id == existing.id).values(
+                    **hashes, is_active=True, updated_at=now,
+                ))
+                click.echo("ensure-admin: administrator login updated.")
+                return
+            organization_id = connection.execute(
+                db.select(organizations.c.id).order_by(organizations.c.created_at).limit(1)
+            ).scalar()
+            if not organization_id:
+                organization_id = str(uuid4())
+                connection.execute(organizations.insert().values(
+                    id=organization_id, name=os.environ.get("ORGANIZATION_NAME", "").strip() or "WaterCare",
+                    created_at=now, updated_at=now,
+                ))
+            user_id = str(uuid4())
+            connection.execute(users.insert().values(
+                id=user_id, email=email, full_name=os.environ.get("ADMIN_NAME", "").strip() or "Administrator",
+                is_active=True, created_at=now, updated_at=now, **hashes,
+            ))
+            connection.execute(memberships.insert().values(
+                id=str(uuid4()), organization_id=organization_id, user_id=user_id,
+                role="administrator", status="active", created_at=now,
+            ))
+        click.echo("ensure-admin: administrator login created.")
 
     @app.cli.command("set-admin-key")
     @click.option("--email", prompt=True)

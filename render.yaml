@@ -1,26 +1,33 @@
 # Render Blueprint for WaterCare. Create it from the dashboard: New > Blueprint > pick this repo.
-# The database is not created here: paste your Supabase "Session pooler" URL (or a Render PostgreSQL
-# internal URL) when Render asks for DATABASE_URL.
+# On every start the app upgrades the database, creates/updates the admin from the ADMIN_* settings,
+# and keeps uploaded files in the Supabase Storage bucket, so no disk is needed.
 services:
   - type: web
     name: watercare
     runtime: docker
     dockerfilePath: ./Dockerfile
-    plan: starter            # a persistent disk and pre-deploy commands need a paid plan
     healthCheckPath: /api/health
-    preDeployCommand: flask --app main:app db upgrade
-    disk:
-      name: watercare-uploads
-      mountPath: /var/data
-      sizeGB: 1
     envVars:
       - key: FLASK_ENV
         value: production
-      - key: STORAGE_PATH
-        value: /var/data/uploads
       - key: SECRET_KEY
         generateValue: true  # a long random value, created once by Render
-      - key: DATABASE_URL
-        sync: false          # you enter this in the dashboard; it is never stored in git
+      - key: STORAGE_PATH
+        value: /tmp/uploads  # only used when the Supabase bucket settings below are missing
       - key: LOG_LEVEL
         value: INFO
+      # Entered in the dashboard; never stored in git.
+      - key: DATABASE_URL
+        sync: false
+      - key: SUPABASE_URL
+        sync: false
+      - key: SUPABASE_SECRET_KEY
+        sync: false
+      - key: SUPABASE_BUCKET
+        sync: false
+      - key: ADMIN_EMAIL
+        sync: false
+      - key: ADMIN_PASSWORD
+        sync: false
+      - key: ADMIN_ACCESS_KEY
+        sync: false

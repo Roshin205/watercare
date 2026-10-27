@@ -12,6 +12,10 @@ class Config:
     SQLALCHEMY_ENGINE_OPTIONS = {"pool_pre_ping": True, "pool_recycle": 300}
     MAX_CONTENT_LENGTH = 15 * 1024 * 1024
     STORAGE_PATH = os.environ.get("STORAGE_PATH", os.path.join("instance", "uploads"))
+    # When all three are set, uploads are kept in this private Supabase Storage bucket instead of STORAGE_PATH.
+    SUPABASE_URL = os.environ.get("SUPABASE_URL", "").strip()
+    SUPABASE_SECRET_KEY = os.environ.get("SUPABASE_SECRET_KEY", "").strip()
+    SUPABASE_BUCKET = os.environ.get("SUPABASE_BUCKET", "").strip()
     SESSION_COOKIE_HTTPONLY = True
     SESSION_COOKIE_SAMESITE = "Lax"
     SESSION_COOKIE_SECURE = os.environ.get("FLASK_ENV") == "production"

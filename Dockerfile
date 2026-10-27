@@ -12,7 +12,8 @@ COPY requirements.txt .
 RUN pip install -r requirements.txt
 
 COPY . .
+RUN sed -i 's/\r$//' start.sh
 
 EXPOSE 10000
-# Render sets PORT; the long timeout leaves room for PDF conversion.
-CMD ["sh", "-c", "gunicorn main:app --bind 0.0.0.0:${PORT:-10000} --workers 2 --timeout 180"]
+# start.sh runs the database upgrade and admin setup, then gunicorn (long timeout for PDF conversion).
+CMD ["sh", "start.sh"]

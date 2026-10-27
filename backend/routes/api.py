@@ -1,13 +1,10 @@
 import csv
 import io
-import os
 import re
 import secrets
-import tempfile
 import uuid
 import zipfile
 from datetime import date, datetime, timezone
-from pathlib import Path
 from uuid import uuid4
 
 from flask import Blueprint, current_app, g, jsonify, request, send_file, session
@@ -20,7 +17,7 @@ from backend.models import (
     approval_history, engineers, memberships, project_engineers, project_tasks, projects,
     uploaded_documents, users, water_testing_records,
 )
-from backend.utils import certificates as certs
+from backend.utils import certificates as certs, storage
 from backend.utils.pdf_convert import PdfUnavailable, convert_to_pdf
 from backend.utils.schedule_export import HEADERS as SCHEDULE_HEADERS, month_year, schedule_rows, schedule_workbook
 from backend.security.authentication import ADMIN_LOGIN_ROLES, LoginRefused, login, require_user
@@ -832,12 +829,7 @@ def upload():
         if not record(table, related_id):
             return failure("not_found", "Related record not found.", 404)
         storage_path = f"{g.organization_id}/{related_type}/{related_id}/{uuid.uuid4().hex}-{secure_filename(filename)}"
-        upload_root = Path(current_app.config["STORAGE_PATH"]).resolve()
-        destination = (upload_root / storage_path).resolve()
-        if not destination.is_relative_to(upload_root):
-            return failure("invalid_request", "Invalid upload destination.", 400)
-        destination.parent.mkdir(parents=True, exist_ok=True)
-        destination.write_bytes(data)
+        storage.save(storage_path, data, content_type)
         metadata = db().table("uploaded_documents").insert({
             "organization_id": g.organization_id, "related_type": related_type,
             "related_id": related_id, "original_filename": filename, "storage_path": storage_path,
@@ -849,11 +841,7 @@ def upload():
         return jsonify({"data": metadata[0]}), 201
     except Exception:
         if storage_path:
-            try:
-                upload_root = Path(current_app.config["STORAGE_PATH"]).resolve()
-                (upload_root / storage_path).resolve().unlink(missing_ok=True)
-            except Exception:
-                current_app.logger.exception("Could not clean up an incomplete document upload.")
+            storage.delete_quietly(storage_path)
         current_app.logger.exception("Document upload failed.")
         return failure("upload_failed", "The document could not be stored.", 503)
 
@@ -1054,70 +1042,51 @@ def permanently_delete_project(project_id):
         documents = scoped_query("uploaded_documents").eq(
             "related_type", "project"
         ).eq("related_id", project_id).execute().data or []
-        upload_root = Path(current_app.config["STORAGE_PATH"]).resolve()
-        paths = []
-        for document in documents:
-            path = (upload_root / document["storage_path"]).resolve()
-            if not path.is_relative_to(upload_root):
-                return failure("storage_error", "A project document has an invalid storage path.", 503)
-            if path.is_file():
-                paths.append(path)
-
-        with tempfile.TemporaryDirectory(dir=upload_root) as quarantine:
-            staged = []
-            try:
-                for index, path in enumerate(paths):
-                    staged_path = Path(quarantine) / str(index)
-                    os.replace(path, staged_path)
-                    staged.append((staged_path, path))
-
-                with sqlalchemy_db.engine.begin() as connection:
-                    connection.execute(
-                        project_tasks.delete().where(
-                            project_tasks.c.organization_id == g.organization_id,
-                            project_tasks.c.project_id == project_id,
-                        )
-                    )
-                    connection.execute(
-                        water_testing_records.update().where(
-                            water_testing_records.c.organization_id == g.organization_id,
-                            water_testing_records.c.project_id == project_id,
-                        ).values(project_id=None)
-                    )
-                    connection.execute(
-                        project_engineers.delete().where(
-                            project_engineers.c.organization_id == g.organization_id,
-                            project_engineers.c.project_id == project_id,
-                        )
-                    )
-                    # Approval history is kept; its reference text still names the deleted project.
-                    connection.execute(
-                        approval_history.update().where(
-                            approval_history.c.organization_id == g.organization_id,
-                            approval_history.c.project_id == project_id,
-                        ).values(project_id=None)
-                    )
-                    connection.execute(
-                        uploaded_documents.delete().where(
-                            uploaded_documents.c.organization_id == g.organization_id,
-                            uploaded_documents.c.related_type == "project",
-                            uploaded_documents.c.related_id == project_id,
-                        )
-                    )
-                    result = connection.execute(
-                        projects.delete().where(
-                            projects.c.organization_id == g.organization_id,
-                            projects.c.id == project_id,
-                        )
-                    )
-                    if result.rowcount != 1:
-                        raise RuntimeError("Project was removed while deletion was in progress.")
-            except Exception:
-                for staged_path, original_path in reversed(staged):
-                    if staged_path.exists():
-                        os.replace(staged_path, original_path)
-                raise
-
+        stored_paths = [document["storage_path"] for document in documents]
+        with sqlalchemy_db.engine.begin() as connection:
+            connection.execute(
+                project_tasks.delete().where(
+                    project_tasks.c.organization_id == g.organization_id,
+                    project_tasks.c.project_id == project_id,
+                )
+            )
+            connection.execute(
+                water_testing_records.update().where(
+                    water_testing_records.c.organization_id == g.organization_id,
+                    water_testing_records.c.project_id == project_id,
+                ).values(project_id=None)
+            )
+            connection.execute(
+                project_engineers.delete().where(
+                    project_engineers.c.organization_id == g.organization_id,
+                    project_engineers.c.project_id == project_id,
+                )
+            )
+            # Approval history is kept; its reference text still names the deleted project.
+            connection.execute(
+                approval_history.update().where(
+                    approval_history.c.organization_id == g.organization_id,
+                    approval_history.c.project_id == project_id,
+                ).values(project_id=None)
+            )
+            connection.execute(
+                uploaded_documents.delete().where(
+                    uploaded_documents.c.organization_id == g.organization_id,
+                    uploaded_documents.c.related_type == "project",
+                    uploaded_documents.c.related_id == project_id,
+                )
+            )
+            result = connection.execute(
+                projects.delete().where(
+                    projects.c.organization_id == g.organization_id,
+                    projects.c.id == project_id,
+                )
+            )
+            if result.rowcount != 1:
+                raise RuntimeError("Project was removed while deletion was in progress.")
+        # The rows are gone, so the files follow; a file left behind is never listed or served again.
+        for stored_path in stored_paths:
+            storage.delete_quietly(stored_path)
         return jsonify({"message": "Project and its saved documents were permanently deleted."})
     except Exception:
         current_app.logger.exception("Permanent project deletion failed.")
@@ -1195,16 +1164,13 @@ def _completion_values(payload, project):
 
 def _retire_old_profile_photos(engineer_id, keep_id):
     old = scoped_query("uploaded_documents").eq("related_type", "engineer").eq("related_id", engineer_id).execute().data or []
-    upload_root = Path(current_app.config["STORAGE_PATH"]).resolve()
     for row in old:
         if row["id"] == keep_id:
             continue
         db().table("uploaded_documents").update({"deleted_at": datetime.now(timezone.utc).isoformat(), "updated_by": g.user.id}).eq(
             "organization_id", g.organization_id
         ).eq("id", row["id"]).execute()
-        path = (upload_root / row["storage_path"]).resolve()
-        if path.is_relative_to(upload_root):
-            path.unlink(missing_ok=True)
+        storage.delete_quietly(row["storage_path"])
 
 
 def _login_password_problem(password):
@@ -1402,12 +1368,11 @@ def download(file_id):
             files[0]["related_type"] != "project" or not record("projects", files[0]["related_id"])
         ):
             return failure("not_found", "File not found.", 404)
-        upload_root = Path(current_app.config["STORAGE_PATH"]).resolve()
-        path = (upload_root / files[0]["storage_path"]).resolve()
-        if not path.is_relative_to(upload_root) or not path.is_file():
+        data = storage.read(files[0]["storage_path"])
+        if data is None:
             return failure("not_found", "File not found.", 404)
         return send_file(
-            path, mimetype=files[0]["mime_type"],
+            io.BytesIO(data), mimetype=files[0]["mime_type"],
             as_attachment=not (request.args.get("inline") == "1" and files[0]["mime_type"].startswith("image/")),
             download_name=files[0]["original_filename"],
         )
@@ -1455,12 +1420,7 @@ def delete_upload(file_id):
         files = scoped_query("uploaded_documents").eq("id", file_id).limit(1).execute().data or []
         if not files:
             return failure("not_found", "File not found.", 404)
-        file_row = files[0]
-        upload_root = Path(current_app.config["STORAGE_PATH"]).resolve()
-        path = (upload_root / file_row["storage_path"]).resolve()
-        if not path.is_relative_to(upload_root):
-            return failure("not_found", "File not found.", 404)
-        path.unlink(missing_ok=True)
+        storage.delete(files[0]["storage_path"])
         db().table("uploaded_documents").update({
             "deleted_at": datetime.now(timezone.utc).isoformat(), "updated_by": g.user.id,
         }).eq("organization_id", g.organization_id).eq("id", file_id).execute()
@@ -1652,11 +1612,11 @@ def _template_row(template_id):
 
 
 def _template_bytes(row):
-    root = Path(current_app.config["STORAGE_PATH"]).resolve()
-    path = (root / row["storage_path"]).resolve()
-    if not path.is_relative_to(root) or not path.is_file():
+    try:
+        return storage.read(row["storage_path"])
+    except storage.StorageError:
+        current_app.logger.exception("Certificate template could not be read.")
         return None
-    return path.read_bytes()
 
 
 @api.get("/certificate-templates")
@@ -1690,13 +1650,12 @@ def upload_certificate_template():
         return failure("invalid_file", f"That file is not a valid .{extension} document.", 400)
     name = (request.form.get("name") or filename.rsplit(".", 1)[0]).strip()[:200]
     storage_path = f"{g.organization_id}/certificate-templates/{uuid.uuid4().hex}-{secure_filename(filename)}"
-    root = Path(current_app.config["STORAGE_PATH"]).resolve()
-    destination = (root / storage_path).resolve()
-    if not destination.is_relative_to(root):
-        return failure("invalid_request", "Invalid upload destination.", 400)
+    mime = {
+        "pptx": "application/vnd.openxmlformats-officedocument.presentationml.presentation",
+        "docx": "application/vnd.openxmlformats-officedocument.wordprocessingml.document",
+    }[extension]
     try:
-        destination.parent.mkdir(parents=True, exist_ok=True)
-        destination.write_bytes(data)
+        storage.save(storage_path, data, mime)
         row = db().table("certificate_templates").insert({
             "organization_id": g.organization_id, "name": name, "service": service["name"],
             "original_filename": filename, "file_type": extension, "storage_path": storage_path,
@@ -1704,7 +1663,7 @@ def upload_certificate_template():
             "created_by": g.user.id, "updated_by": g.user.id,
         }).execute().data[0]
     except Exception:
-        destination.unlink(missing_ok=True)
+        storage.delete_quietly(storage_path)
         current_app.logger.exception("Certificate template upload failed.")
         return failure("storage_error", "The template could not be saved.", 503)
     row.pop("storage_path", None)
@@ -1721,8 +1680,7 @@ def delete_certificate_template(template_id):
     db().table("certificate_templates").update({
         "deleted_at": datetime.now(timezone.utc).isoformat(), "updated_by": g.user.id,
     }).eq("organization_id", g.organization_id).eq("id", template_id).execute()
-    root = Path(current_app.config["STORAGE_PATH"]).resolve()
-    (root / row["storage_path"]).resolve().unlink(missing_ok=True)
+    storage.delete_quietly(row["storage_path"])
     return jsonify({"message": "Template deleted."})
 
 
