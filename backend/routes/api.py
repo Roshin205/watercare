@@ -9,6 +9,7 @@ from uuid import uuid4
 
 from flask import Blueprint, current_app, g, jsonify, request, send_file, session
 from sqlalchemy import String, cast, func, or_, select
+from sqlalchemy.exc import SQLAlchemyError
 from werkzeug.security import generate_password_hash
 from werkzeug.utils import secure_filename
 
@@ -241,6 +242,14 @@ def login_route():
         account = login(payload["email"].strip(), payload["password"], login_type, access_key)
     except LoginRefused as error:
         return failure("wrong_login", str(error), 403)
+    except SQLAlchemyError:
+        sqlalchemy_db.session.rollback()
+        current_app.logger.exception("Sign-in could not read the accounts table.")
+        return failure(
+            "database_unavailable",
+            "Sign-in is unavailable: the database cannot be reached or is not set up yet. Check the server logs.",
+            503,
+        )
     if not account:
         message = "Email, password or private key is incorrect." if login_type == "admin" else "Email or password is incorrect."
         return failure("unauthorized", message, 401)

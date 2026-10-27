@@ -372,7 +372,7 @@ def run_browser_test(filename):
         pytest.skip("Node.js is required for the browser form tests.")
     result = subprocess.run(
         [node, "--test", str(Path(__file__).parent / "js" / filename)],
-        capture_output=True, text=True, timeout=60,
+        stdin=subprocess.DEVNULL, capture_output=True, text=True, timeout=60,
     )
     assert result.returncode == 0, result.stdout + result.stderr
 
@@ -1385,3 +1385,15 @@ def test_production_accepts_cloud_files_without_a_disk(monkeypatch):
     CloudConfig.SUPABASE_BUCKET = ""
     with pytest.raises(RuntimeError):
         create_app(CloudConfig)
+
+
+def test_empty_database_reports_not_set_up_instead_of_a_server_error():
+    application = create_app(TestConfig)
+    with application.app_context():
+        test_client = application.test_client()
+        assert test_client.get("/api/health").json == {"status": "database_not_set_up"}
+        response = test_client.post("/api/auth/login", json={
+            "email": "owner@example.test", "password": "secure-test-password", "login_type": "admin", "access_key": ADMIN_KEY,
+        })
+        assert response.status_code == 503
+        assert "not set up" in response.json["error"]["message"]

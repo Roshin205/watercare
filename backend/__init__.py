@@ -66,10 +66,17 @@ def create_app(config_object=Config):
         try:
             with db.engine.connect() as connection:
                 connection.exec_driver_sql("SELECT 1")
-            return jsonify({"status": "ok"}), 200
         except Exception:
             app.logger.warning("Database health check failed.", exc_info=True)
             return jsonify({"status": "database_unavailable"}), 503
+        try:
+            with db.engine.connect() as connection:
+                connection.exec_driver_sql("SELECT 1 FROM users LIMIT 1")
+        except Exception:
+            # Reachable but empty: `flask --app main:app db upgrade` (run by start.sh) has not created the tables.
+            app.logger.warning("Database has no WaterCare tables yet.", exc_info=True)
+            return jsonify({"status": "database_not_set_up"}), 503
+        return jsonify({"status": "ok"}), 200
 
     @app.cli.command("create-admin")
     @click.option("--email", prompt=True)
