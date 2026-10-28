@@ -1,0 +1,22 @@
+# Packages for the Cloudflare Python Worker (installed by pywrangler). Local development still uses requirements.txt.
+[project]
+name = "watercare"
+version = "1.0.0"
+description = "WaterCare water testing and tank cleaning monitoring, on Cloudflare Workers + D1 + R2"
+requires-python = ">=3.12"
+dependencies = [
+    "flask>=3.0,<4.0",
+    "flask-sqlalchemy>=3.1,<4.0",
+    "sqlalchemy>=2.0,<3.0",
+    "openpyxl>=3.1,<4.0",
+    "reportlab>=4.0,<6.0",
+    "python-pptx>=1.0,<2.0",
+    "python-docx>=1.1,<2.0",
+    "workers-runtime-sdk>=1.9",
+]
+
+[dependency-groups]
+dev = [
+    "workers-py",
+    "workers-runtime-sdk",
+]

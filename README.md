@@ -2,48 +2,109 @@
 
 WaterCare is a Flask application for employee-managed client, project, engineer, water-testing, tank-cleaning, schedule, and report records. The existing Arabic-inspired interface and its calendar, client filtering, date-wise work list, project map, completion approvals, and report exports remain served by Flask.
 
+## Where it runs
+
+| Part | Cloudflare service | In this repository |
+| --- | --- | --- |
+| Website and API (the Flask app) | Python Worker `watercare` | `cloudflare/worker.py`, `backend/`, `templates/`, `wrangler.jsonc`, `pyproject.toml` |
+| CSS, JavaScript, images under `/static` | Workers Static Assets (served without running the Worker) | `static/` |
+| Database | D1 database `watercare` (binding `DB`) | `d1-migrations/` |
+| Photos, certificate templates, documents | Private R2 bucket `watercare-files` (binding `FILES`) | `backend/utils/storage.py` |
+| Certificate PDFs | Worker `watercare-pdf` + a LibreOffice Container (binding `PDF`) | `pdf-converter/` |
+
+Plan: **Workers Paid ($5/month)**. A sign-in checks two PBKDF2 hashes (about 0.5 s of CPU), which is far over the free
+plan's 10 ms per request, and Containers are only offered on the paid plan. D1 and R2 usage stays within their included
+amounts for a company of this size.
+
+How the Flask app fits Workers: Flask runs through Cloudflare's WSGI adapter. SQLAlchemy builds the same SQLite SQL as
+before and `backend/d1.py` sends it to D1 through the binding (parameterised `?` placeholders, never string-joined
+values). D1 has no multi-statement transactions, so each statement is saved on its own. Python's `hashlib` has no
+PBKDF2 or scrypt inside Workers, so `backend/security/passwords.py` uses the runtime's Web Crypto API and writes the same
+`pbkdf2:sha256:600000$salt$hash` format a normal Python server reads.
+
 ## Local setup
 
-1. Install Python 3.11 or newer and create a virtual environment.
-2. Install packages with `pip install -r requirements.txt`.
-3. Copy `.env.example` to `.env`. Set a private random `SECRET_KEY`; use a local PostgreSQL URL or leave `DATABASE_URL` unset for the local SQLite database.
-4. Apply the additive schema migration with `flask --app main:app db upgrade`.
-5. Create the first organization administrator using `flask --app main:app create-admin`.
-6. Start development with `python main.py`.
+1. Install Python 3.12 or newer. Install packages with `pip install -r requirements-local.txt`.
+2. Copy `.env.example` to `.env` and set a private random `SECRET_KEY`. Without `DATABASE_URL` the app uses the SQLite
+   file `instance/watercare.db` and keeps uploads in `instance/uploads`.
+3. Create or update the local tables with `flask --app main:app db upgrade`.
+4. Create the first administrator with `flask --app main:app create-admin`.
+5. Start with `python main.py` and open http://127.0.0.1:5000.
 
-Administrators can create `service_coordinator`, `accountant`, `employee`, and `viewer` login accounts through `POST /api/auth/users`; passwords must be at least 12 characters. An employee account also gets an engineer profile; add its Engineer ID on the Engineers page. Employees change their own passwords through `POST /api/auth/change-password`. The command `flask --app main:app set-password` lets an operator reset an account after verifying the request. Passwords are stored as Werkzeug hashes and are never returned by the API.
+Tests: `python -m pytest`. Run them again through the D1 driver with `WATERCARE_TEST_D1=1 python -m pytest`.
 
-## Render deployment
+### Running the Worker locally (Cloudflare's runtime, local D1 and R2)
 
-Create or select a Render PostgreSQL instance, then set these environment variables on the existing Web Service:
+Needs Node.js 20+ and `uv` (`pip install uv`).
 
-| Variable | Value |
-| --- | --- |
-| `DATABASE_URL` | Render PostgreSQL **internal** connection URL |
-| `SECRET_KEY` | New, randomly generated private value |
-| `FLASK_ENV` | `production` |
-| `STORAGE_PATH` | `/var/data/uploads` when a persistent disk is mounted at `/var/data`; otherwise set a confirmed durable storage path |
-| `LOG_LEVEL` | `INFO` |
-
-Use `pip install -r requirements.txt` as the build command. Before starting the web process, run `flask --app main:app db upgrade` as a controlled deployment/pre-deploy step; do not run destructive schema operations or downgrade production tables. Start with:
-
-```text
-gunicorn main:app --bind 0.0.0.0:$PORT --workers 2 --timeout 120
+```bash
+cp .dev.vars.example .dev.vars          # then put a random 64-character SECRET_KEY in it
+npx wrangler d1 migrations apply watercare --local
+python scripts/d1_admin.py --email you@example.com --local
+uv run pywrangler dev
 ```
 
-Configure `/api/health` as the Render health-check path. If the database is unavailable, the endpoint returns a generic 503 response without disclosing connection details.
+Open http://localhost:8787. Certificates need the PDF converter; without it the download explains that it is missing.
 
-## Database and existing records
+On Windows, keep the project on drive C: when running `pywrangler`. A path bug in `uv` points the Pyodide environment at
+the wrong drive for projects on D: (error "Python interpreter not found ... pyodide-venv"). Running from a C: folder,
+WSL or another computer avoids it.
 
-Render PostgreSQL is authoritative after cutover. Migrations create tables only when they do not exist and do not drop or replace existing data. The first migration is an additive baseline for a new WaterCare database; the prior hosted database is not automatically copied. Export and verify existing organization, user, client, project, schedule, cleaning, testing, and document metadata before cutover. Do not delete or disable the previous database until counts, relationships, and application access have been checked against the new instance.
+## Deploying to Cloudflare
 
-Schema changes must be reviewed and committed as Alembic revisions. Use `flask --app main:app db migrate -m "describe change"` to generate a revision, review its operations, and apply it with `db upgrade`.
+One-time setup (logged in with `npx wrangler login`, Workers Paid plan active):
 
-Revision `202610260006` adds Engineer IDs (unique per organization), custom schedule dates, invoice numbers, approval status and rejection reason, project latitude/longitude, and the `approval_history` table. It only adds columns and tables. Existing projects keep their Monthly/Weekly schedule values; projects that are not yet completed start with approval status `Pending`, and projects completed before approvals existed keep a blank approval status. Any `manager` accounts become `service_coordinator` accounts. Run `flask --app main:app db upgrade` locally and as the Render pre-deploy step to apply it.
+```bash
+npx wrangler d1 create watercare                 # copy the printed database_id into wrangler.jsonc
+npx wrangler r2 bucket create watercare-files    # stays private: no public access or custom domain on it
+npx wrangler d1 migrations apply watercare --remote
+npx wrangler secret put SECRET_KEY               # paste a random value of at least 32 characters
+python scripts/d1_admin.py --email you@example.com --remote
+```
+
+Deploy the PDF converter first (Docker Desktop must be running, it builds the container image), then the website:
+
+```bash
+cd pdf-converter && npm install && npx wrangler deploy && cd ..
+uv run pywrangler deploy
+```
+
+Later updates: `uv run pywrangler deploy` (and `npx wrangler deploy` in `pdf-converter/` if that changed). New database
+changes go in a new numbered file in `d1-migrations/` and are applied with
+`npx wrangler d1 migrations apply watercare --remote` before deploying the code that uses them.
+
+Check the deployed site at `https://watercare.<your-subdomain>.workers.dev/api/health` (`{"status": "ok"}`), and follow
+the Worker's logs with `npx wrangler tail watercare`.
+
+`scripts/d1_admin.py` also resets the administrator's password and private key: run it again with the same email.
+Passwords are hashed on your computer and only the hashes are sent to D1.
+
+## Moving existing records and files
+
+Nothing is deleted from the old database or the old upload folder; the steps only copy.
+
+1. Apply the D1 schema first: `npx wrangler d1 migrations apply watercare --remote`.
+2. Export the rows: `python scripts/export_to_d1.py --source instance/watercare.db --out d1-import.sql`. The script
+   prints each table's row count and lists accounts whose passwords are stored as `scrypt` (those cannot be checked in
+   the Worker and need a new password: `scripts/d1_admin.py` for administrators, the Engineers page for employees).
+3. Load them: `npx wrangler d1 execute watercare --remote --file d1-import.sql`, then delete `d1-import.sql`.
+4. Copy the files under the same keys: `python scripts/export_to_d1.py --source instance/watercare.db --upload-files --remote`.
+5. Compare counts before switching users over, for example
+   `npx wrangler d1 execute watercare --remote --command "SELECT COUNT(*) FROM projects"`.
+
+Administrators can create `service_coordinator`, `accountant`, `employee`, and `viewer` login accounts through `POST /api/auth/users`; passwords must be at least 12 characters. An employee account also gets an engineer profile; add its Engineer ID on the Engineers page. Employees change their own passwords through `POST /api/auth/change-password`. The command `flask --app main:app set-password` lets an operator reset an account after verifying the request. Passwords are stored as PBKDF2 hashes and are never returned by the API.
+
+## Database
+
+D1 is authoritative once the site runs on Cloudflare. `d1-migrations/0001_initial_schema.sql` creates every table, foreign key and index; it was generated from the local Alembic migrations, so a local SQLite database and D1 have the same layout and records copy across unchanged. Locally the Alembic revisions in `migrations/` still manage `instance/watercare.db`. A test (`test_d1_migration_creates_every_table_and_column_the_app_uses`) fails if the D1 schema misses anything the app uses.
+
+Schema history:
+
+Revision `202610260006` adds Engineer IDs (unique per organization), custom schedule dates, invoice numbers, approval status and rejection reason, project latitude/longitude, and the `approval_history` table. It only adds columns and tables. Existing projects keep their Monthly/Weekly schedule values; projects that are not yet completed start with approval status `Pending`, and projects completed before approvals existed keep a blank approval status. Any `manager` accounts become `service_coordinator` accounts. Locally, `flask --app main:app db upgrade` applies it; on Cloudflare the D1 schema already contains it.
 
 Revision `202610270007` adds the project priority date and rank used to persist manual work-order changes. It adds columns only; existing projects remain in date order until someone reorders them.
 
-Revision `202610280008` adds the actual completion date and completion engineer name. It maps existing completion timing and awaiting-approval values to the current form labels while preserving project and approval history data. Run `flask --app main:app db upgrade` to apply it before using the updated completion form.
+Revision `202610280008` adds the actual completion date and completion engineer name. It maps existing completion timing and awaiting-approval values to the current form labels while preserving project and approval history data. Locally, `flask --app main:app db upgrade` applies it; on Cloudflare the D1 schema already contains it.
 
 ## Authentication and access control
 
@@ -59,7 +120,7 @@ Flask stores authenticated employee identity in a signed, HTTP-only session cook
 
 A worker submits the Work Completion & Approval Form against the existing project. Client, project, and scheduled-date details are prefilled; the worker enters the invoice number and completion engineer, uploads before- and after-work photos, and selects the actual completion date. The form displays whether completion was before, on, or after the scheduled date, and the server independently derives and saves that category from the two dates. Submissions are marked **Pending Approval** and shown to Service Coordinators, Accountants, and Administrators with the completion details and photos. An approver can approve (the project becomes **Approved** and **Completed**) or reject with a reason (**Rejected**; the worker can correct and resubmit). Every status change is recorded in `approval_history`.
 
-There is no public registration route. Create accounts only for authorized employees. For a password reset, verify the employee through the organization’s normal process and run the `set-password` CLI command on the deployed service or from a trusted operator environment.
+There is no public registration route. Create accounts only for authorized employees. For a password reset, verify the employee through the organization’s normal process and reset it from the Engineers page (employees) or with `scripts/d1_admin.py` (the administrator).
 
 ## Project work order and filters
 
@@ -88,9 +149,9 @@ flask --app main:app set-admin-key --email you@example.com
 
 ## Documents
 
-The application stores uploads under `STORAGE_PATH` and stores metadata and organization associations in PostgreSQL. Files are served only through an authenticated, organization-scoped route. Render's default filesystem is ephemeral; configure and mount a persistent disk before enabling production uploads, and keep its mount path synchronized with `STORAGE_PATH`. The existing bucket named `Water-managment` could not be identified from this source repository: its storage provider and credentials must be verified with the bucket owner before it can be reused. No external storage integration or credentials are assumed.
+On Cloudflare, uploads (before/after photos, engineer photos, certificate templates) are stored in the private R2 bucket `watercare-files` under keys like `<organization>/<kind>/<record>/<random>-<file name>`, and their names, types, sizes and links to projects, engineers and clients are stored in D1 (`uploaded_documents`, `certificate_templates`). Files are only served through the signed-in, organization-scoped `/api/uploads/<id>` route; the bucket itself is never public. Upload types are checked by their actual content (PDF, Excel, PNG, JPEG, PowerPoint, Word), up to 15 MB. Locally the same keys are used under `STORAGE_PATH`.
 
-Back up the PostgreSQL database and persistent disk independently, and periodically test restoring both.
+D1 has Time Travel (restore to any point in the last 30 days on the paid plan); R2 objects are kept until deleted. Export both periodically if you need longer-term copies.
 
 ## Project map
 
@@ -132,30 +193,6 @@ The **Certificates** page (administrator, service coordinator, accountant) keeps
 `{{expiry_date}}`, `{{so_number}}`, `{{contract_period}}`, `{{engineer_name}}`, `{{invoice_number}}` and `{{issue_date}}`.
 Once an engineer's completion is approved, everyone who can see that project gets a **Download certificate** button that
 fills the newest template for the project's service and downloads it as a PDF. Fonts are kept as in the template and no
-text is bold. The PDF is made by LibreOffice (install it on the server and make sure `soffice` is on PATH) or, on a Windows
-computer, by Microsoft PowerPoint/Word; without either the download shows an error.
-
-## Deploying with the Render Blueprint
-
-`render.yaml` and the `Dockerfile` set up a Docker web service with the health check at `/api/health`. The container
-runs `start.sh`, which upgrades the database, runs `flask --app main:app ensure-admin`, then starts gunicorn. (On a
-non-Docker Python service, use `sh start.sh` as the Start Command.) The image installs LibreOffice so certificate PDFs work.
-
-Environment variables to set on the service:
-
-| Variable | Value |
-|---|---|
-| `DATABASE_URL` | Supabase **Session pooler** connection string with the database password, ending `?sslmode=require` |
-| `SECRET_KEY` | long random value (generated by the Blueprint) |
-| `FLASK_ENV` | `production` |
-| `SUPABASE_URL` | the project URL, e.g. `https://<project-ref>.supabase.co` |
-| `SUPABASE_SECRET_KEY` | the project's secret key (`sb_secret_…`), or the legacy `service_role` key |
-| `SUPABASE_BUCKET` | the private Storage bucket that holds uploads, e.g. `Water-managment` |
-| `ADMIN_EMAIL`, `ADMIN_PASSWORD`, `ADMIN_ACCESS_KEY` | the administrator login; password and key 12+ characters |
-
-With the three `SUPABASE_*` values set, every upload (project photos, engineer photos, certificate templates) is stored
-in the bucket and no disk is needed. Without them the app falls back to `STORAGE_PATH` on local disk.
-
-`ensure-admin` creates the administrator on the first start and, on later starts, resets that account's password and
-private key to the `ADMIN_*` values, so changing them in Render and redeploying is how to recover the admin login.
-Optional: `ADMIN_NAME` and `ORGANIZATION_NAME` (used only when the account or company is first created).
+text is bold. On Cloudflare the PDF is made by LibreOffice in the `watercare-pdf` container; put licensed font files (for
+example Trebuchet MS) in `pdf-converter/fonts/` so the PDF uses the template's fonts. Locally, LibreOffice or Microsoft
+PowerPoint/Word on Windows is used. Without a converter the download shows an error.

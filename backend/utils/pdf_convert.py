@@ -1,6 +1,7 @@
-"""Turn a filled PowerPoint or Word certificate into a PDF using software installed on the machine.
+"""Turn a filled PowerPoint or Word certificate into a PDF.
 
-Order tried: LibreOffice (any platform), then Microsoft PowerPoint / Word on Windows.
+Inside the Cloudflare Worker the file is sent to the LibreOffice container (service binding PDF, see pdf-converter/).
+Elsewhere the software installed on the machine is used: LibreOffice, then Microsoft PowerPoint / Word on Windows.
 """
 import os
 import shutil
@@ -19,6 +20,33 @@ WINDOWS_APPS = {
 
 class PdfUnavailable(Exception):
     """No converter is installed, or it failed."""
+
+
+def _with_container(data, extension):
+    from js import Object, Request
+    from pyodide.ffi import run_sync, to_js
+
+    from backend.runtime import worker_env
+
+    env = worker_env()
+    converter = getattr(env, "PDF", None) if env is not None else None
+    if converter is None:
+        raise PdfUnavailable("The PDF converter service (binding PDF) is not configured for this Worker.")
+    request = Request.new("https://pdf-converter/convert", to_js({
+        "method": "POST", "body": to_js(bytes(data)), "headers": {"X-File-Type": extension},
+    }, dict_converter=Object.fromEntries))
+    try:
+        response = run_sync(converter.fetch(request))
+        if hasattr(response, "bytes"):  # the Workers SDK wraps the reply in its Python Response
+            body = bytes(run_sync(response.bytes()))
+        else:
+            buffer = run_sync(response.arrayBuffer())
+            body = buffer.to_bytes() if hasattr(buffer, "to_bytes") else bytes(buffer)
+    except Exception as error:
+        raise PdfUnavailable(f"The PDF converter could not be reached: {error}") from error
+    if response.status != 200 or not body.startswith(b"%PDF"):
+        raise PdfUnavailable(f"The PDF converter answered {response.status}.")
+    return body
 
 
 def _libreoffice():
@@ -53,6 +81,10 @@ def _with_windows_office(extension, source, target):
 
 
 def convert_to_pdf(data, extension):
+    from backend.runtime import in_workers
+
+    if in_workers():
+        return _with_container(data, extension)
     with _lock, tempfile.TemporaryDirectory() as folder:
         source = Path(folder, f"certificate.{extension}")
         target = Path(folder, "certificate.pdf")

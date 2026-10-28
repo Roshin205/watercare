@@ -3,10 +3,10 @@ from types import SimpleNamespace
 
 from flask import current_app, g, jsonify, request, session
 from sqlalchemy import select
-from werkzeug.security import check_password_hash
 
 from backend.database import db
 from backend.models import memberships, users
+from backend.security.passwords import verify_password
 
 
 def require_user(roles=None):
@@ -56,7 +56,7 @@ def login(email, password, login_type="client", access_key=""):
     if len(password) > 512 or len(access_key) > 512:
         return None
     row = db.session.execute(select(users).where(users.c.email == email.lower())).mappings().first()
-    if not row or not row["is_active"] or not check_password_hash(row["password_hash"], password):
+    if not row or not row["is_active"] or not verify_password(row["password_hash"], password):
         return None
     organization_rows = db.session.execute(
         select(memberships.c.organization_id, memberships.c.role)
@@ -70,7 +70,7 @@ def login(email, password, login_type="client", access_key=""):
         if role not in ADMIN_LOGIN_ROLES:
             raise LoginRefused("This account uses the Client login.")
         # The key must exist and match; accounts without a key cannot use the admin login at all.
-        if not row["access_key_hash"] or not access_key or not check_password_hash(row["access_key_hash"], access_key):
+        if not row["access_key_hash"] or not access_key or not verify_password(row["access_key_hash"], access_key):
             return None
     elif role in ADMIN_LOGIN_ROLES:
         raise LoginRefused("This account uses the Admin login, with its private key.")

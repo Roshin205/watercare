@@ -1,16 +1,13 @@
-"""Where uploaded files live: a private Supabase Storage bucket when it is configured, otherwise a folder on disk.
+"""Where uploaded files live: the private R2 bucket bound to the Worker as FILES, or a folder on disk elsewhere.
 
-Configure the bucket with SUPABASE_URL, SUPABASE_SECRET_KEY and SUPABASE_BUCKET. Paths look like
-"<organization>/<kind>/<record>/<file>" in both places, so the database rows are the same either way.
+Keys look like "<organization>/<kind>/<record>/<file>" in both places, so the database rows are the same either way.
+The bucket is never public: files are only served through the app's signed-in routes.
 """
-import urllib.error
-import urllib.parse
-import urllib.request
 from pathlib import Path
 
 from flask import current_app
 
-TIMEOUT_SECONDS = 60
+from backend.runtime import in_workers, worker_env
 
 
 class StorageError(Exception):
@@ -18,43 +15,39 @@ class StorageError(Exception):
 
 
 def _bucket():
-    config = current_app.config
-    url, key, bucket = config.get("SUPABASE_URL"), config.get("SUPABASE_SECRET_KEY"), config.get("SUPABASE_BUCKET")
-    return (url.rstrip("/"), key, bucket) if url and key and bucket else None
+    env = worker_env()
+    if env is None:
+        raise StorageError("The R2 bucket is only reachable while handling a Worker request.")
+    return env.FILES
 
 
-def uses_cloud():
-    return _bucket() is not None
+def _checked_key(storage_path):
+    parts = storage_path.split("/")
+    if not storage_path or storage_path.startswith("/") or any(part in ("", ".", "..") for part in parts):
+        raise StorageError("Invalid storage path.")
+    return storage_path
 
 
 def _local_path(storage_path):
     root = Path(current_app.config["STORAGE_PATH"]).resolve()
-    path = (root / storage_path).resolve()
+    path = (root / _checked_key(storage_path)).resolve()
     if not path.is_relative_to(root):
         raise StorageError("Invalid storage path.")
     return path
 
 
-def _cloud(method, storage_path, data=None, headers=None):
-    url, key, bucket = _bucket()
-    if ".." in storage_path.split("/"):
-        raise StorageError("Invalid storage path.")
-    address = f"{url}/storage/v1/object/{urllib.parse.quote(bucket)}/{urllib.parse.quote(storage_path)}"
-    # New secret keys (sb_secret_...) go only in the apikey header; older service_role JWTs also need Authorization.
-    sent = {"apikey": key, **(headers or {})}
-    if key.startswith("eyJ"):
-        sent["Authorization"] = f"Bearer {key}"
-    request = urllib.request.Request(address, data=data, method=method, headers=sent)
-    with urllib.request.urlopen(request, timeout=TIMEOUT_SECONDS) as response:
-        return response.read()
-
-
 def save(storage_path, data, content_type):
-    if uses_cloud():
+    if in_workers():
+        from js import Object
+        from pyodide.ffi import run_sync, to_js
+
         try:
-            _cloud("POST", storage_path, data, {"Content-Type": content_type, "x-upsert": "true"})
-        except (urllib.error.URLError, OSError) as error:
-            raise StorageError(f"Cloud upload failed: {error}") from error
+            options = to_js({"httpMetadata": {"contentType": content_type}}, dict_converter=Object.fromEntries)
+            run_sync(_bucket().put(_checked_key(storage_path), to_js(bytes(data)), options))
+        except StorageError:
+            raise
+        except Exception as error:
+            raise StorageError(f"R2 upload failed: {error}") from error
         return
     path = _local_path(storage_path)
     path.parent.mkdir(parents=True, exist_ok=True)
@@ -63,29 +56,33 @@ def save(storage_path, data, content_type):
 
 def read(storage_path):
     """The file's bytes, or None when it is not there."""
-    if uses_cloud():
+    if in_workers():
+        from pyodide.ffi import run_sync
+
         try:
-            return _cloud("GET", storage_path)
-        except urllib.error.HTTPError as error:
-            if error.code in (400, 404):
+            stored = run_sync(_bucket().get(_checked_key(storage_path)))
+            if stored is None:
                 return None
-            raise StorageError(f"Cloud download failed: {error}") from error
-        except (urllib.error.URLError, OSError) as error:
-            raise StorageError(f"Cloud download failed: {error}") from error
+            return bytes(run_sync(stored.arrayBuffer()))
+        except StorageError:
+            raise
+        except Exception as error:
+            raise StorageError(f"R2 download failed: {error}") from error
     path = _local_path(storage_path)
     return path.read_bytes() if path.is_file() else None
 
 
 def delete(storage_path):
     """Remove the file; a file that is already gone is not an error."""
-    if uses_cloud():
+    if in_workers():
+        from pyodide.ffi import run_sync
+
         try:
-            _cloud("DELETE", storage_path)
-        except urllib.error.HTTPError as error:
-            if error.code not in (400, 404):
-                raise StorageError(f"Cloud delete failed: {error}") from error
-        except (urllib.error.URLError, OSError) as error:
-            raise StorageError(f"Cloud delete failed: {error}") from error
+            run_sync(_bucket().delete(_checked_key(storage_path)))
+        except StorageError:
+            raise
+        except Exception as error:
+            raise StorageError(f"R2 delete failed: {error}") from error
         return
     _local_path(storage_path).unlink(missing_ok=True)
 

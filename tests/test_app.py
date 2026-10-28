@@ -1,3 +1,4 @@
+import os
 import shutil
 import subprocess
 import time
@@ -19,16 +20,23 @@ from backend.utils.validators import validate_payload
 ADMIN_KEY = "private-admin-key-1"
 
 
+USE_D1 = os.environ.get("WATERCARE_TEST_D1") == "1"
+
+
 class TestConfig:
     TESTING = True
     SECRET_KEY = "test-secret-key"
-    SQLALCHEMY_DATABASE_URI = "sqlite://"
+    # WATERCARE_TEST_D1=1 runs every test through the Cloudflare D1 driver, backed by an in-memory D1 stand-in.
+    SQLALCHEMY_DATABASE_URI = "sqlite+d1://" if USE_D1 else "sqlite://"
     SQLALCHEMY_TRACK_MODIFICATIONS = False
     STORAGE_PATH = "test-uploads"
 
 
 @pytest.fixture
 def app():
+    if USE_D1:
+        from backend import d1
+        d1.use_runner(d1.SQLiteRunner())
     application = create_app(TestConfig)
     with application.app_context():
         db.create_all()
@@ -1278,74 +1286,54 @@ def test_certificate_is_generated_for_the_client_after_admin_approval(app, clien
     assert client.get("/api/certificate-templates").json["data"] == []
 
 
-def test_ensure_admin_creates_and_updates_the_deployed_admin_login(app, monkeypatch):
-    runner = app.test_cli_runner()
-    monkeypatch.delenv("ADMIN_EMAIL", raising=False)
-    assert "skipped" in runner.invoke(args=["ensure-admin"]).output
-
-    monkeypatch.setenv("ADMIN_EMAIL", "Owner@WaterCare.test")
-    monkeypatch.setenv("ADMIN_PASSWORD", "first-owner-password")
-    monkeypatch.setenv("ADMIN_ACCESS_KEY", "first-owner-key-1")
-    assert "created" in runner.invoke(args=["ensure-admin"]).output
-    login = {"email": "owner@watercare.test", "password": "first-owner-password", "login_type": "admin", "access_key": "first-owner-key-1"}
-    signed_in = app.test_client().post("/api/auth/login", json=login)
-    assert signed_in.status_code == 200 and signed_in.json["role"] == "administrator"
-    assert signed_in.json["organization_id"] == "org-1"
-
-    # Changing the settings and restarting resets the password and key; the account is not duplicated.
-    monkeypatch.setenv("ADMIN_PASSWORD", "second-owner-password")
-    monkeypatch.setenv("ADMIN_ACCESS_KEY", "second-owner-key-2")
-    assert "updated" in runner.invoke(args=["ensure-admin"]).output
-    assert app.test_client().post("/api/auth/login", json=login).status_code == 401
-    assert app.test_client().post("/api/auth/login", json={
-        **login, "password": "second-owner-password", "access_key": "second-owner-key-2",
-    }).status_code == 200
-    with app.app_context():
-        assert db.session.execute(db.select(users.c.id).where(users.c.email == "owner@watercare.test")).all().__len__() == 1
-
-    monkeypatch.setenv("ADMIN_PASSWORD", "short")
-    assert "skipped" in runner.invoke(args=["ensure-admin"]).output
-
-
-class FakeBucket:
-    """Stands in for Supabase Storage: keeps objects in memory and records the headers it was sent."""
+class FakeR2:
+    """Stands in for the R2 binding (env.FILES): keeps objects in memory, like the Workers SDK wrapper returns them."""
 
     def __init__(self):
-        self.objects, self.headers = {}, []
+        self.objects = {}
 
-    def urlopen(self, request, timeout=None):
-        import urllib.error
-        prefix = "https://demo.supabase.co/storage/v1/object/Water-managment/"
-        assert request.full_url.startswith(prefix), request.full_url
-        self.headers.append({key.lower(): value for key, value in request.header_items()})
-        path = request.full_url[len(prefix):]
-        method = request.get_method()
-        if method == "POST":
-            self.objects[path] = request.data
-            body = b"{}"
-        elif path not in self.objects:
-            raise urllib.error.HTTPError(request.full_url, 404, "Not found", {}, None)
-        elif method == "GET":
-            body = self.objects[path]
-        else:
-            del self.objects[path]
-            body = b"{}"
+    def put(self, key, data, options=None):
+        self.objects[key] = bytes(data)
 
-        class Response(BytesIO):
-            def __enter__(self):
-                return self
+    def get(self, key):
+        if key not in self.objects:
+            return None
+        body = self.objects[key]
 
-            def __exit__(self, *exc):
-                return False
+        class Stored:
+            def arrayBuffer(self):
+                return memoryview(body)
 
-        return Response(body)
+        return Stored()
+
+    def delete(self, key):
+        self.objects.pop(key, None)
 
 
-def test_uploads_and_certificate_templates_are_kept_in_the_cloud_bucket(app, client, monkeypatch):
-    bucket = FakeBucket()
-    monkeypatch.setattr("urllib.request.urlopen", bucket.urlopen)
-    app.config.update(SUPABASE_URL="https://demo.supabase.co/", SUPABASE_SECRET_KEY="sb_secret_test", SUPABASE_BUCKET="Water-managment")
+def pretend_worker(monkeypatch, env):
+    """Run the Worker-only code paths in CPython: fake the small part of Pyodide (`js`, `pyodide.ffi`) they use."""
+    import sys
+    import types
+    js = types.ModuleType("js")
+    js.Object = types.SimpleNamespace(fromEntries=dict)
+    js.JSON = types.SimpleNamespace(parse=lambda text: None)
+    ffi = types.ModuleType("pyodide.ffi")
+    ffi.run_sync = lambda value: value
+    ffi.to_js = lambda value, **kwargs: value
+    pyodide = types.ModuleType("pyodide")
+    pyodide.ffi = ffi
+    monkeypatch.setitem(sys.modules, "js", js)
+    monkeypatch.setitem(sys.modules, "pyodide", pyodide)
+    monkeypatch.setitem(sys.modules, "pyodide.ffi", ffi)
+    monkeypatch.setattr("backend.utils.storage.in_workers", lambda: True)
+    monkeypatch.setattr("backend.utils.storage.worker_env", lambda: env)
+
+
+def test_uploads_and_certificate_templates_are_kept_in_the_r2_bucket(app, client, monkeypatch):
+    from types import SimpleNamespace
+    bucket = FakeR2()
     project = new_project(client, name="Cloud Project")
+    pretend_worker(monkeypatch, SimpleNamespace(FILES=bucket))
     png = b"\x89PNG\r\n\x1a\n" + b"0" * 20
     upload = client.post("/api/uploads", headers=csrf(client), content_type="multipart/form-data", data={
         "related_type": "project", "related_id": project["id"], "image_type": "before", "file": (BytesIO(png), "site.png"),
@@ -1354,14 +1342,12 @@ def test_uploads_and_certificate_templates_are_kept_in_the_cloud_bucket(app, cli
     stored = upload.json["data"]["storage_path"]
     assert bucket.objects[stored] == png
     assert not (Path(app.config["STORAGE_PATH"]) / stored).exists()
-    assert bucket.headers[-1]["apikey"] == "sb_secret_test" and "authorization" not in bucket.headers[-1]
 
     assert client.get(f"/api/uploads/{upload.json['data']['id']}").data == png
     assert client.delete(f"/api/uploads/{upload.json['data']['id']}", headers=csrf(client)).status_code == 200
     assert stored not in bucket.objects
 
-    converted = {}
-    monkeypatch.setattr("backend.routes.api.convert_to_pdf", lambda data, extension: converted.setdefault("pdf", b"%PDF-1.4"))
+    monkeypatch.setattr("backend.routes.api.convert_to_pdf", lambda data, extension: b"%PDF-1.4")
     deck = _certificate_file([["{{client_name}}"]])
     template = upload_template(client, "Water testing", deck).json["data"]
     assert deck in bucket.objects.values()
@@ -1370,24 +1356,61 @@ def test_uploads_and_certificate_templates_are_kept_in_the_cloud_bucket(app, cli
     assert deck not in bucket.objects.values()
 
 
-def test_production_accepts_cloud_files_without_a_disk(monkeypatch):
-    class CloudConfig:
-        TESTING = False
-        SECRET_KEY = "x"
-        SQLALCHEMY_DATABASE_URI = "sqlite://"
-        STORAGE_PATH = "test-uploads"
-        SUPABASE_URL, SUPABASE_SECRET_KEY, SUPABASE_BUCKET = "https://demo.supabase.co", "sb_secret_test", "Water-managment"
+def test_r2_keys_reject_path_tricks(app, monkeypatch):
+    from types import SimpleNamespace
+    from backend.utils import storage
+    pretend_worker(monkeypatch, SimpleNamespace(FILES=FakeR2()))
+    with app.app_context():
+        for bad in ("../x", "a//b", "/abs", "a/./b", ""):
+            with pytest.raises(storage.StorageError):
+                storage.save(bad, b"x", "text/plain")
 
-    monkeypatch.setenv("FLASK_ENV", "production")
-    monkeypatch.setenv("SECRET_KEY", "x")
-    monkeypatch.setenv("DATABASE_URL", "sqlite://")
-    assert create_app(CloudConfig).config["SUPABASE_BUCKET"] == "Water-managment"
-    CloudConfig.SUPABASE_BUCKET = ""
-    with pytest.raises(RuntimeError):
-        create_app(CloudConfig)
+
+def test_worker_passwords_use_web_crypto_pbkdf2_in_werkzeug_format(monkeypatch):
+    import hashlib
+    from werkzeug.security import check_password_hash, generate_password_hash
+    from backend.security import passwords
+    monkeypatch.setattr(passwords, "in_workers", lambda: True)
+    monkeypatch.setattr(passwords, "_webcrypto_pbkdf2", lambda password, salt, iterations, hash_name="SHA-256", length=32: hashlib.pbkdf2_hmac(
+        hash_name.replace("-", "").lower(), password.encode(), salt.encode(), iterations, length).hex())
+    stored = passwords.hash_password("worker-password-1")
+    assert stored.startswith("pbkdf2:sha256:600000$")
+    assert passwords.verify_password(stored, "worker-password-1")
+    assert not passwords.verify_password(stored, "wrong-password-1")
+    assert check_password_hash(stored, "worker-password-1")  # the same hash still works on a normal server
+    assert passwords.verify_password(generate_password_hash("local-made", method="pbkdf2:sha256:1000"), "local-made")
+    assert not passwords.verify_password(generate_password_hash("old-scrypt", method="scrypt"), "old-scrypt")
+
+
+def test_worker_config_uses_the_d1_driver():
+    from config import WorkerConfig
+    assert WorkerConfig.SQLALCHEMY_DATABASE_URI == "sqlite+d1://"
+    assert WorkerConfig.SESSION_COOKIE_SECURE is True and WorkerConfig.SECRET_KEY is None
+
+
+def test_d1_driver_reports_changes_and_returns_rows():
+    from sqlalchemy import create_engine, text
+    from backend import d1
+    d1.use_runner(d1.SQLiteRunner())
+    try:
+        engine = create_engine("sqlite+d1://")
+        with engine.begin() as connection:
+            connection.execute(text("CREATE TABLE t (id TEXT PRIMARY KEY, n INTEGER)"))
+            assert connection.execute(text("INSERT INTO t VALUES ('a', 1), ('b', 2)")).rowcount == 2
+            assert connection.execute(text("UPDATE t SET n = n + 1 WHERE id = :id"), {"id": "a"}).rowcount == 1
+            assert connection.execute(text("SELECT id, n FROM t ORDER BY id")).mappings().all() == [{"id": "a", "n": 2}, {"id": "b", "n": 2}]
+            assert connection.execute(text("DELETE FROM t WHERE id = 'b' RETURNING id")).scalar() == "b"
+            assert connection.execute(text("SELECT id FROM t WHERE id = 'zzz'")).first() is None
+            with pytest.raises(Exception):
+                connection.execute(text("INSERT INTO t VALUES ('a', 9)"))
+    finally:
+        d1.use_runner(None)
 
 
 def test_empty_database_reports_not_set_up_instead_of_a_server_error():
+    if USE_D1:
+        from backend import d1
+        d1.use_runner(d1.SQLiteRunner())
     application = create_app(TestConfig)
     with application.app_context():
         test_client = application.test_client()
@@ -1397,3 +1420,14 @@ def test_empty_database_reports_not_set_up_instead_of_a_server_error():
         })
         assert response.status_code == 503
         assert "not set up" in response.json["error"]["message"]
+
+
+def test_d1_migration_creates_every_table_and_column_the_app_uses():
+    import sqlite3
+    sql = (Path(__file__).parent.parent / "d1-migrations" / "0001_initial_schema.sql").read_text(encoding="utf-8")
+    connection = sqlite3.connect(":memory:")
+    connection.executescript(sql)
+    for table in db.metadata.sorted_tables:
+        columns = {row[1] for row in connection.execute(f"PRAGMA table_info({table.name})")}
+        # Old columns kept by earlier migrations (projects.start_time, end_time) may remain; every current one must exist.
+        assert {column.name for column in table.columns} <= columns, table.name

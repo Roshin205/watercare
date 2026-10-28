@@ -3,7 +3,6 @@ from uuid import uuid4
 
 from flask_sqlalchemy import SQLAlchemy
 from sqlalchemy import and_, delete, insert, select, update
-from sqlalchemy.dialects.postgresql import insert as pg_insert
 from sqlalchemy.dialects.sqlite import insert as sqlite_insert
 db = SQLAlchemy(session_options={"expire_on_commit": False})
 
@@ -137,23 +136,13 @@ class Query:
                 prepared = [self._prepare(dict(value)) for value in values]
                 statement = insert(self.table).values(prepared)
                 if self.operation == "upsert" and self.conflict:
-                    if session.get_bind().dialect.name == "postgresql":
-                        statement = pg_insert(self.table).values(prepared).on_conflict_do_update(
-                            index_elements=self.conflict,
-                            set_={key: value for key, value in prepared[0].items() if key not in self.conflict},
-                        )
-                    elif session.get_bind().dialect.name == "sqlite":
-                        statement = sqlite_insert(self.table).values(prepared).on_conflict_do_update(
-                            index_elements=self.conflict,
-                            set_={key: value for key, value in prepared[0].items() if key not in self.conflict},
-                        )
-                if session.get_bind().dialect.name in ("postgresql", "sqlite"):
-                    statement = statement.returning(*self.table.c)
-                    result = session.execute(statement)
-                    rows = [self._serialize(row) for row in result.mappings().all()]
-                else:
-                    session.execute(statement)
-                    rows = []
+                    statement = sqlite_insert(self.table).values(prepared).on_conflict_do_update(
+                        index_elements=self.conflict,
+                        set_={key: value for key, value in prepared[0].items() if key not in self.conflict},
+                    )
+                # SQLite and D1 both return the stored rows directly.
+                result = session.execute(statement.returning(*self.table.c))
+                rows = [self._serialize(row) for row in result.mappings().all()]
                 session.commit()
                 return Result(rows)
 

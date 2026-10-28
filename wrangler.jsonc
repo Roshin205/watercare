@@ -1,0 +1,44 @@
+// WaterCare on Cloudflare: Python Worker (Flask) + D1 + R2 + the PDF converter container (pdf-converter/).
+// Deploy: uv run pywrangler deploy   ·   Local: uv run pywrangler dev
+{
+  "$schema": "node_modules/wrangler/config-schema.json",
+  "name": "watercare",
+  "main": ".worker-build/worker.py",
+  "compatibility_date": "2026-10-01",
+  "compatibility_flags": ["python_workers"],
+  // Copies only the app's code, templates and static files into .worker-build/ before every dev run and deploy.
+  "build": {
+    "command": "python scripts/build_worker.py",
+    "watch_dir": ["backend", "templates", "static", "cloudflare"]
+  },
+  // /static/... is served straight from Cloudflare's asset storage; every other path runs the Flask app.
+  "assets": {
+    "directory": ".worker-build/assets"
+  },
+  "d1_databases": [
+    {
+      "binding": "DB",
+      "database_name": "watercare",
+      // Replace with the id printed by: npx wrangler d1 create watercare
+      "database_id": "00000000-0000-0000-0000-000000000000",
+      "migrations_dir": "d1-migrations"
+    }
+  ],
+  "r2_buckets": [
+    {
+      // Private bucket: files are only served through the app's signed-in routes.
+      "binding": "FILES",
+      "bucket_name": "watercare-files"
+    }
+  ],
+  "services": [
+    {
+      // Certificate PDFs: the LibreOffice container Worker in pdf-converter/ (deploy it first).
+      "binding": "PDF",
+      "service": "watercare-pdf"
+    }
+  ],
+  "observability": {
+    "enabled": true
+  }
+}

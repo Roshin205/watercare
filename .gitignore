@@ -12,3 +12,13 @@ __pycache__/
 instance/
 *.db
 test-uploads/
+# Cloudflare Workers
+.worker-build/
+.wrangler/
+python_modules/
+node_modules/
+.dev.vars
+uv.lock
+.venv-workers/
+.venv-uv/
+pylock.toml

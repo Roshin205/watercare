@@ -10,7 +10,6 @@ from uuid import uuid4
 from flask import Blueprint, current_app, g, jsonify, request, send_file, session
 from sqlalchemy import String, cast, func, or_, select
 from sqlalchemy.exc import SQLAlchemyError
-from werkzeug.security import generate_password_hash
 from werkzeug.utils import secure_filename
 
 from backend.database import db as sqlalchemy_db
@@ -21,6 +20,7 @@ from backend.models import (
 from backend.utils import certificates as certs, storage
 from backend.utils.pdf_convert import PdfUnavailable, convert_to_pdf
 from backend.utils.schedule_export import HEADERS as SCHEDULE_HEADERS, month_year, schedule_rows, schedule_workbook
+from backend.security.passwords import hash_password, verify_password
 from backend.security.authentication import ADMIN_LOGIN_ROLES, LoginRefused, login, require_user
 from backend.utils.validators import (
     APPROVAL_STATUSES, FREQUENCY_FIELDS, RESOURCE_FIELDS, validate_payload, validate_settings,
@@ -303,8 +303,8 @@ def create_user():
     try:
         sqlalchemy_db.session.execute(users.insert().values(
             id=user_id, email=email.lower(), full_name=full_name.strip(),
-            password_hash=generate_password_hash(password), is_active=True,
-            access_key_hash=generate_password_hash(access_key) if role in ADMIN_LOGIN_ROLES else None,
+            password_hash=hash_password(password), is_active=True,
+            access_key_hash=hash_password(access_key) if role in ADMIN_LOGIN_ROLES else None,
             created_at=now, updated_at=now,
         ))
         sqlalchemy_db.session.execute(memberships.insert().values(
@@ -338,12 +338,10 @@ def change_password():
     ):
         return failure("invalid_request", "Provide your current password and a new password between 12 and 512 characters.", 400)
     account = sqlalchemy_db.session.execute(select(users).where(users.c.id == g.user.id)).mappings().first()
-    from werkzeug.security import check_password_hash
-
-    if not account or not check_password_hash(account["password_hash"], payload["current_password"]):
+    if not account or not verify_password(account["password_hash"], payload["current_password"]):
         return failure("unauthorized", "Current password is incorrect.", 401)
     sqlalchemy_db.session.execute(users.update().where(users.c.id == g.user.id).values(
-        password_hash=generate_password_hash(payload["new_password"]),
+        password_hash=hash_password(payload["new_password"]),
         updated_at=datetime.now(timezone.utc).isoformat(),
     ))
     sqlalchemy_db.session.commit()
@@ -1199,7 +1197,7 @@ def _stage_login(email, full_name, password):
     user_id, now = str(uuid4()), datetime.now(timezone.utc).isoformat()
     sqlalchemy_db.session.execute(users.insert().values(
         id=user_id, email=email.strip().lower(), full_name=str(full_name).strip(),
-        password_hash=generate_password_hash(password), is_active=True, created_at=now, updated_at=now,
+        password_hash=hash_password(password), is_active=True, created_at=now, updated_at=now,
     ))
     sqlalchemy_db.session.execute(memberships.insert().values(
         id=str(uuid4()), organization_id=g.organization_id, user_id=user_id, role="employee", status="active", created_at=now,
@@ -1214,7 +1212,7 @@ def _stage_password_reset(user_id, password):
     if role in ADMIN_LOGIN_ROLES:
         raise ValueError("Admin-level passwords cannot be changed from the Engineers page.")
     sqlalchemy_db.session.execute(users.update().where(users.c.id == user_id).values(
-        password_hash=generate_password_hash(password), updated_at=datetime.now(timezone.utc).isoformat(),
+        password_hash=hash_password(password), updated_at=datetime.now(timezone.utc).isoformat(),
     ))
 
 

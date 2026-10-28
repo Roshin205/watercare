@@ -1,0 +1,2 @@
+# Copy to .dev.vars for `uv run pywrangler dev` (never commit .dev.vars). Production: npx wrangler secret put SECRET_KEY
+SECRET_KEY=replace-with-a-long-random-value-of-at-least-32-characters
