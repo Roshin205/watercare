@@ -15,6 +15,7 @@ test-uploads/
 # Cloudflare Workers
 .worker-build/
 .wrangler/
+.cloudflare/
 python_modules/
 node_modules/
 .dev.vars

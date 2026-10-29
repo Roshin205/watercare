@@ -19,8 +19,8 @@
     {
       "binding": "DB",
       "database_name": "watercare",
-      // Replace with the id printed by: npx wrangler d1 create watercare
-      "database_id": "00000000-0000-0000-0000-000000000000",
+      // Created with: npx wrangler d1 create watercare (region APAC)
+      "database_id": "220190cb-9556-4c3d-9daa-43f6521ca37e",
       "migrations_dir": "d1-migrations"
     }
   ],
