@@ -60,7 +60,10 @@ def create_app(config_object=Config):
 
     @app.get("/")
     def index():
-        return render_template("index.html")
+        response = app.make_response(render_template("index.html"))
+        # Browsers check for a newer page on every visit, so a deploy (new logo, new script version) shows at once.
+        response.headers["Cache-Control"] = "no-cache"
+        return response
 
     @app.get("/api/health")
     def health():

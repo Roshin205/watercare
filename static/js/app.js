@@ -18,7 +18,16 @@
     Clients: { path: "clients", fields: ["name", "organization_name", "contact_person", "phone", "email", "address", "category", "notes"], columns: ["name", "contact_person", "phone", "email"] },
     Engineers: { path: "engineers", fields: ["engineer_code", "full_name", "email", "phone", "specialization", "availability"], columns: ["engineer_code", "full_name", "specialization", "email", "phone"] }
   };
-  const fieldLabels = { name: "Name", description: "Description", certificate_text: "Certificate wording", validity_months: "Valid for (months)", is_active: "Status", engineer_code: "Engineer ID", full_name: "Engineer name", engineer_id: "Engineer", approval_status: "approval" };
+  const fieldLabels = {
+    name: "Name", description: "Description", certificate_text: "Certificate Wording", validity_months: "Valid For (Months)", is_active: "Status",
+    engineer_code: "Engineer ID", full_name: "Engineer Name", engineer_id: "Engineer", approval_status: "Approval",
+    client_name: "Client Name", service: "Service", so_no: "SO No.", start_date: "Start Date", visit_time: "Visit Time", end_date: "End Date",
+    location: "Location", engineer_name: "Engineer Name", engineer_visit: "Engineer Visit", organization_name: "Organization Name",
+    contact_person: "Contact Person", phone: "Phone", email: "Email", address: "Address", category: "Category", notes: "Notes",
+    specialization: "Specialization", availability: "Availability",
+  };
+  // Headings and labels start every word with a capital; fields without a set label get one from their name.
+  const labelFor = field => fieldLabels[field] || field.replaceAll("_", " ").replace(/\b[a-z]/g, letter => letter.toUpperCase());
   let csrfToken = "", loginType = "admin", markerById = {}, currentUserId = "", currentUser = {};
   // Settings > Display (the user's own choice, else the company's) and the company details from Settings > Company.
   let prefs = { date_format: "YYYY-MM-DD", time_format: "24h", time_zone: "" }, company = {};
@@ -286,7 +295,7 @@
     scheduleEnd = droppedDate;
     scheduleMonth = new Date(Number(droppedDate.slice(0, 4)), Number(droppedDate.slice(5, 7)) - 1, 1);
     pickingScheduleEnd = false;
-    $("#schedule-title").textContent = "Schedule project";
+    $("#schedule-title").textContent = "Schedule Project";
     $("#schedule-project-name").textContent = scheduleProjectName(project);
     $("#schedule-message").textContent = "";
     $("#schedule-form").querySelector('[name="schedule-mode"][value="single"]').checked = true;
@@ -489,7 +498,7 @@
     const shown = page, definition = resources[page], reorder = page === "Projects" && canEdit();
     const photoColumn = page === "Engineers", columnCount = definition.columns.length + 1 + (reorder ? 1 : 0) + (photoColumn ? 1 : 0);
     $("#records-title").textContent = page;
-    $("#table-head").innerHTML = `<tr>${reorder ? '<th class="handle-col" aria-label="Work order"></th>' : ""}${photoColumn ? "<th>Photo</th>" : ""}${definition.columns.map(field => `<th>${escapeHtml(fieldLabels[field] || field.replaceAll("_", " "))}</th>`).join("")}<th>Actions</th></tr>`;
+    $("#table-head").innerHTML = `<tr>${reorder ? '<th class="handle-col" aria-label="Work order"></th>' : ""}${photoColumn ? "<th>Photo</th>" : ""}${definition.columns.map(field => `<th>${escapeHtml(labelFor(field))}</th>`).join("")}<th>Actions</th></tr>`;
     try {
       const query = filterParams(PAGE_FILTERS[page]);
       query.set("limit", "200");
@@ -704,7 +713,7 @@
   async function openForm(id, defaults = {}) {
     editingId = id || null;
     const definition = resources[page], existing = { ...defaults, ...(records.find(record => record.id === id) || {}) };
-    $("#form-title").textContent = `${id ? "Edit" : "Add"} ${page.toLowerCase().replace(/s$/, "")}`;
+    $("#form-title").textContent = `${id ? "Edit" : "Add"} ${page.replace(/s$/, "")}`;
     $("#form-message").textContent = "";
     // Only administrators set an employee's sign-in password, so the field exists only for them.
     const formFields = page === "Engineers" && currentRole === "administrator" ? [...definition.fields, "login_password"] : definition.fields;
@@ -712,7 +721,7 @@
       const labels = { client_name: "Client", name: "Project", service: "Service", so_no: "SO No", start_date: "Start Date", visit_time: "Engineer Visit Time", end_date: "End Date", location: "Location", system_details: "System Details", engineer_name: "Engineer", engineer_visit: "Engineer Visit", engineer_visit_custom_date: "Engineer Visit Date", microbiology: "Microbiology", microbiology_frequency: "Microbiology Options", microbiology_custom_date: "Microbiology Date", legionella: "Legionella", legionella_frequency: "Legionella Options", legionella_custom_date: "Legionella Date" };
       if (page === "Projects" && field === "location_map") return locationPicker();
       const engineerLabels = { email: "Email (Gmail used to sign in)", login_password: id ? "New login password (leave blank to keep)" : "Login password (12+ characters)" };
-      const label = page === "Projects" ? labels[field] : (page === "Engineers" && engineerLabels[field]) || fieldLabels[field] || field.replaceAll("_", " ");
+      const label = page === "Projects" ? labels[field] : (page === "Engineers" && engineerLabels[field]) || labelFor(field);
       let control, className = "";
       if (page === "Projects" && field === "service") {
         const options = services.filter(service => service.is_active || service.name === existing[field]).map(service => service.name);
@@ -1052,7 +1061,7 @@
     $("#saved-project-images").innerHTML = saved.map(file => `<figure><img src="${api}/uploads/${encodeURIComponent(file.id)}?inline=1" alt="${escapeHtml(file.image_type)} image: ${escapeHtml(file.original_filename)}"><figcaption>${escapeHtml(file.image_type === "before" ? "Before" : "After")} · ${escapeHtml(file.original_filename)}</figcaption></figure>`).join("") || '<p class="muted">No project images saved.</p>';
     $("#completion-approval").classList.toggle("hidden", !approval && project.status !== "Completed");
     $("#completion-approval").innerHTML = `<p><b>${escapeHtml(project.client_name || "")}</b> · <b>${escapeHtml(project.name || "")}</b></p><p>Approval status: <span class="status-badge approval-${slug(approval)}">${escapeHtml(approval || "Completed before approvals")}</span></p>${project.completion_engineer_name ? `<p>Engineer: ${escapeHtml(project.completion_engineer_name)}</p>` : ""}${project.completion_date ? `<p>Actual completion date: ${escapeHtml(project.completion_date)}</p>` : ""}${approval === "Rejected" && project.rejection_reason ? `<p class="rejection">Rejection reason: ${escapeHtml(project.rejection_reason)}</p>` : ""}`;
-    $("#completion-history").innerHTML = history.length ? `<h3>Approval history</h3><ol>${history.map(entry => `<li><b>${escapeHtml(entry.action)}</b> · ${escapeHtml(entry.previous_status)} → ${escapeHtml(entry.new_status)} · ${escapeHtml(entry.actor_name)} · ${escapeHtml(formatDateTime(entry.created_at))}${entry.reason ? `<br><span class="rejection">Reason: ${escapeHtml(entry.reason)}</span>` : ""}</li>`).join("")}</ol>` : "";
+    $("#completion-history").innerHTML = history.length ? `<h3>Approval History</h3><ol>${history.map(entry => `<li><b>${escapeHtml(entry.action)}</b> · ${escapeHtml(entry.previous_status)} → ${escapeHtml(entry.new_status)} · ${escapeHtml(entry.actor_name)} · ${escapeHtml(formatDateTime(entry.created_at))}${entry.reason ? `<br><span class="rejection">Reason: ${escapeHtml(entry.reason)}</span>` : ""}</li>`).join("")}</ol>` : "";
     updateCompletionDateFields();
     $("#completion-dialog").showModal();
   }
@@ -1282,9 +1291,9 @@
     fitProjects();
   }
   function renderReports() {
-    $("#records-title").textContent = "Reports & exports";
+    $("#records-title").textContent = "Reports & Exports";
     $("#records-count").textContent = "Downloads use the filters above";
-    $("#table-head").innerHTML = "<tr><th>Report</th><th>File format</th><th>Action</th></tr>";
+    $("#table-head").innerHTML = "<tr><th>Report</th><th>File Format</th><th>Action</th></tr>";
     const choices = [["Projects","projects"],["Clients","clients"]];
     $("#table-body").innerHTML = choices.map(([label, value]) => `<tr><td>${label}</td><td>CSV · Excel · PDF</td><td>${["csv","xlsx","pdf"].map(format => `<a href="${api}/reports/export?resource=${value}&format=${format}" data-report="${value}" data-format="${format}">${format.toUpperCase()}</a>`).join(" · ")}</td></tr>`).join("");
   }
@@ -1312,7 +1321,7 @@
     $("#table-head").innerHTML = "";
     const today = isoDate(new Date()), saved = message => { showError(message); $("#notice").classList.remove("error"); };
     pageHost().innerHTML = `<div id="settings-page">
-      <section class="cert-section"><h3>My account</h3>
+      <section class="cert-section"><h3>My Account</h3>
         <form id="settings-name" class="cert-row"><label>Your name<input name="full_name" maxlength="255" required value="${escapeHtml(currentUser.full_name || "")}"></label>
         <label>Email<input value="${escapeHtml(currentUser.email || "")}" disabled></label>
         <button class="primary" type="submit">Save name</button></form></section>
@@ -1390,14 +1399,14 @@
     $("#cert-saved").innerHTML = certificateRows(templates);
   }
   function drawCertificatePage() {
-    const upload = `<section class="cert-section"><h3>Upload new statement templates</h3>
+    const upload = `<section class="cert-section"><h3>Upload New Statement Templates</h3>
       <form id="cert-upload" class="cert-row"><label>Template name<input name="name" maxlength="200" placeholder="e.g. Disinfection certificate"></label>
       <label>Certificate type<select name="service" required>${certificateServiceOptions()}</select></label>
       <div class="file-field"><label class="primary file-pick"><input name="file" type="file" accept=".pptx,.docx" required><span>Select the editable file</span></label><small class="file-name">No file selected</small></div>
       <button class="primary" type="submit">Upload template</button></form></section>`;
     pageHost().innerHTML = `<div id="cert-page">${upload}
-      <section class="cert-section"><h3>Saved templates</h3>
-      <div class="table-scroll"><table class="cert-table"><thead><tr><th>Template</th><th>Certificate type</th><th>Type</th><th>Uploaded</th><th>Action</th></tr></thead>
+      <section class="cert-section"><h3>Saved Templates</h3>
+      <div class="table-scroll"><table class="cert-table"><thead><tr><th>Template</th><th>Certificate Type</th><th>Type</th><th>Uploaded</th><th>Action</th></tr></thead>
       <tbody id="cert-saved">${certificateRows(null)}</tbody></table></div></section></div>`;
     const picker = $("#cert-upload [name=file]");
     picker.onchange = () => { $("#cert-upload .file-name").textContent = picker.files[0]?.name || "No file selected"; };

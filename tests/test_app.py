@@ -458,6 +458,7 @@ def test_settings_are_saved_with_organization_and_user_scope(client):
 def test_login_shell_shows_the_wolgan_brand_and_developer_credit_and_has_no_provider_globals(app):
     response = app.test_client().get("/")
     assert response.status_code == 200
+    assert response.headers["Cache-Control"] == "no-cache"
     assert b"<title>Wolgan |" in response.data and b"Welcome to Wolgan" in response.data
     assert b"Website created by <b>Roshin VP</b>" in response.data
     assert b"to=devroshinvp@gmail.com" in response.data
