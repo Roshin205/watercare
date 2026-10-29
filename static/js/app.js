@@ -19,7 +19,11 @@
     Engineers: { path: "engineers", fields: ["engineer_code", "full_name", "email", "phone", "specialization", "availability"], columns: ["engineer_code", "full_name", "specialization", "email", "phone"] }
   };
   const fieldLabels = { name: "Name", description: "Description", certificate_text: "Certificate wording", validity_months: "Valid for (months)", is_active: "Status", engineer_code: "Engineer ID", full_name: "Engineer name", engineer_id: "Engineer", approval_status: "approval" };
-  let csrfToken = "", loginType = "admin", markerById = {}, currentUserId = "";
+  let csrfToken = "", loginType = "admin", markerById = {}, currentUserId = "", currentUser = {};
+  // Settings > Display (the user's own choice, else the company's) and the company details from Settings > Company.
+  let prefs = { date_format: "YYYY-MM-DD", time_format: "24h", time_zone: "" }, company = {};
+  const DATE_FORMATS = ["YYYY-MM-DD", "DD/MM/YYYY", "MM/DD/YYYY"];
+  const DEV_CONTACT = "https://mail.google.com/mail/?view=cm&fs=1&to=devroshinvp@gmail.com&su=Wolgan%20website%20enquiry";
   // Which filter bar controls each page uses; "day" narrows the dashboard to one date, "range" is a from/to pair.
   const PAGE_FILTERS = {
     Dashboard: ["search", "client", "project", "day"],
@@ -68,7 +72,7 @@
     try {
       const current = await request("/auth/me");
       csrfToken = current.csrf_token || csrfToken;
-      currentUserId = current.user.id;
+      currentUserId = current.user.id; currentUser = current.user;
       $("#login").classList.add("hidden"); $("#app").classList.remove("hidden");
       currentRole = current.role;
       document.querySelectorAll("[data-action]").forEach(button => {
@@ -87,13 +91,34 @@
           mapPanel.classList.add("hidden");
         }
       }
-      $("#user-email").textContent = `${current.user.email || "Employee"} | ${ROLE_LABELS[current.role] || current.role}`;
-      await Promise.all([loadClients(), loadEngineers(), loadProjectOptions(), loadServices()]); navigate("Dashboard");
+      showUserLabel();
+      await Promise.all([loadPreferences(), loadClients(), loadEngineers(), loadProjectOptions(), loadServices()]); navigate("Dashboard");
     } catch (error) {
       csrfToken = "";
       $("#app").classList.add("hidden"); $("#login").classList.remove("hidden");
       $("#login-message").textContent = error.message;
     }
+  }
+  function showUserLabel() {
+    $("#user-email").textContent = `${currentUser.full_name || currentUser.email || "Employee"} | ${ROLE_LABELS[currentRole] || currentRole}`;
+  }
+  async function loadPreferences() {
+    try {
+      const settings = await request("/settings");
+      const organization = settings.organization || {}, mine = settings.user || {};
+      company = organization;
+      prefs = {
+        date_format: mine.date_format || organization.date_format || "YYYY-MM-DD",
+        time_format: mine.time_format || organization.time_format || "24h",
+        time_zone: mine.time_zone || "",  // blank: this device's time zone
+      };
+    } catch (error) { showError(error.message); }
+    renderSupport();
+  }
+  function renderSupport() {
+    const phone = company.support_phone || "", email = company.support_email || "", box = $("#support-box");
+    box.classList.toggle("hidden", !phone && !email);
+    box.innerHTML = `<b>Need help?</b>${phone ? `<a href="tel:${escapeHtml(phone.replace(/[^0-9+]/g, ""))}">${escapeHtml(phone)}</a>` : ""}${email ? `<a href="mailto:${escapeHtml(email)}">${escapeHtml(email)}</a>` : ""}`;
   }
   async function loadClients() {
     try {
@@ -119,16 +144,38 @@
   }
   function slug(value) { return String(value || "").toLowerCase().replace(/[^a-z0-9]+/g, "-"); }
   function isoDate(dateValue) { return `${dateValue.getFullYear()}-${String(dateValue.getMonth() + 1).padStart(2, "0")}-${String(dateValue.getDate()).padStart(2, "0")}`; }
+  // Dates are stored as YYYY-MM-DD and times as HH:MM; these show them the way Settings > Display asks for.
+  function showDate(value, format = prefs.date_format) {
+    const match = /^(\d{4})-(\d{2})-(\d{2})/.exec(value || "");
+    if (!match) return value || "";
+    const [, year, monthNumber, day] = match;
+    return { "DD/MM/YYYY": `${day}/${monthNumber}/${year}`, "MM/DD/YYYY": `${monthNumber}/${day}/${year}` }[format] || `${year}-${monthNumber}-${day}`;
+  }
+  function showTime(value) {
+    const match = /^(\d{1,2}):(\d{2})/.exec(value || "");
+    if (!match || prefs.time_format !== "12h") return value || "";
+    const hour = Number(match[1]);
+    return `${hour % 12 || 12}:${match[2]} ${hour < 12 ? "AM" : "PM"}`;
+  }
   function formatDateTime(value) {
     const parsed = new Date(value);
-    return Number.isNaN(parsed.getTime()) ? value || "" : parsed.toLocaleString(undefined, { dateStyle: "medium", timeStyle: "short" });
+    if (Number.isNaN(parsed.getTime())) return value || "";
+    let parts;
+    try {
+      parts = new Intl.DateTimeFormat("en-CA", {
+        year: "numeric", month: "2-digit", day: "2-digit", hour: "2-digit", minute: "2-digit", hourCycle: "h23",
+        ...(prefs.time_zone ? { timeZone: prefs.time_zone } : {}),
+      }).formatToParts(parsed);
+    } catch { return parsed.toLocaleString(); }  // a time zone this browser does not know
+    const part = Object.fromEntries(parts.map(({ type, value: text }) => [type, text]));
+    return `${showDate(`${part.year}-${part.month}-${part.day}`)} ${showTime(`${part.hour}:${part.minute}`)}`;
   }
   function engineerLabel(engineer) { return engineer.engineer_code ? `${engineer.full_name} (${engineer.engineer_code})` : engineer.full_name; }
   function scheduleText(project, group) {
     if (group.toggle && project[group.toggle] === "No") return "No";
     const frequency = project[group.frequency];
     if (!frequency) return "";
-    return frequency === "Custom" && project[group.date] ? `Custom · ${project[group.date]}` : frequency;
+    return frequency === "Custom" && project[group.date] ? `Custom · ${showDate(project[group.date])}` : frequency;
   }
   function projectDay(project) { return project.start_date || project.scheduled_date || project.contract_period || ""; }
   function dayHeading(value) {
@@ -163,6 +210,8 @@
     if (field === "engineer_visit") return scheduleText(record, FREQUENCY_GROUPS[0]);
     if (field === "is_active") return record.is_active ? "Active" : "Inactive";
     if (field === "approval_status") return record.approval_status || (record.status === "Completed" ? "Completed" : "");
+    if (["start_date", "end_date", "completion_date"].includes(field)) return showDate(record[field]);
+    if (field === "visit_time") return showTime(record[field]);
     return record[field];
   }
 
@@ -355,23 +404,23 @@
     const service = project.service || { cleaning: "Tank cleaning", water_testing: "Water testing" }[task.record_type] || task.title;
     const details = [
       ["Service", service],
-      ["Dates", project.start_date ? `${project.start_date}${project.end_date && project.end_date !== project.start_date ? ` to ${project.end_date}` : ""}` : ""],
+      ["Dates", project.start_date ? `${showDate(project.start_date)}${project.end_date && project.end_date !== project.start_date ? ` to ${showDate(project.end_date)}` : ""}` : ""],
       ["Engineer", task.engineer_name || project.engineer_name || "Engineer not assigned"],
       ["Location", task.location || project.location || "Location not set"],
-      ["Time", task.scheduled_time || "Time not set"],
+      ["Time", showTime(task.scheduled_time) || "Time not set"],
       ["SO No", project.so_no],
       ["Engineer visit", scheduleText(project, FREQUENCY_GROUPS[0])],
       ["Microbiology", scheduleText(project, FREQUENCY_GROUPS[1])],
       ["Legionella", scheduleText(project, FREQUENCY_GROUPS[2])],
       ["Completion", project.completion_status],
-      ["Actual completion date", project.completion_date],
+      ["Actual completion date", showDate(project.completion_date)],
       ["Completion engineer", project.completion_engineer_name],
       ["Invoice No.", project.invoice_number],
       ["Rejection reason", approval === "Rejected" ? project.rejection_reason : ""],
       ["Details", task.description || task.notes || project.system_details],
     ].filter(([, value]) => value !== undefined && value !== null && value !== "");
     const movable = reorder && task.record_type === "project" && project.id;
-    return `<details class="task-item"${movable ? ` data-project-id="${escapeHtml(project.id)}"` : ""}><summary>${movable ? dragHandle() : ""}<span class="task-names"><strong>${escapeHtml(project.client_name || "Client not set")}</strong><strong>${escapeHtml(project.name || task.title)}</strong></span><span class="task-meta"><span class="status-badge">${escapeHtml(task.status || "Scheduled")}</span>${approval ? `<span class="status-badge approval-${slug(approval)}">${escapeHtml(approval)}</span>` : ""}${task.scheduled_time ? `<span class="task-time">${escapeHtml(task.scheduled_time)}</span>` : ""}</span></summary><dl class="task-details">${details.map(([label, value]) => `<div><dt>${escapeHtml(label)}</dt><dd>${escapeHtml(value)}</dd></div>`).join("")}</dl>${projectActions(project, true)}</details>`;
+    return `<details class="task-item"${movable ? ` data-project-id="${escapeHtml(project.id)}"` : ""}><summary>${movable ? dragHandle() : ""}<span class="task-names"><strong>${escapeHtml(project.client_name || "Client not set")}</strong><strong>${escapeHtml(project.name || task.title)}</strong></span><span class="task-meta"><span class="status-badge">${escapeHtml(task.status || "Scheduled")}</span>${approval ? `<span class="status-badge approval-${slug(approval)}">${escapeHtml(approval)}</span>` : ""}${task.scheduled_time ? `<span class="task-time">${escapeHtml(showTime(task.scheduled_time))}</span>` : ""}</span></summary><dl class="task-details">${details.map(([label, value]) => `<div><dt>${escapeHtml(label)}</dt><dd>${escapeHtml(value)}</dd></div>`).join("")}</dl>${projectActions(project, true)}</details>`;
   }
   function certificateButton(project, outline) {
     return project.approval_status === "Approved" ? `<button${outline ? ' class="outline"' : ""} data-project-certificate="${escapeHtml(project.id)}">Download certificate</button>` : "";
@@ -406,7 +455,7 @@
     page = nextPage; hideError();
     // Nothing from the previous page stays on screen while this page's data loads.
     if (changed) { $("#table-head").innerHTML = ""; $("#table-body").innerHTML = ""; $("#records-count").textContent = ""; }
-    $("#cert-host")?.remove(); $("#table-body").closest(".table-wrap").classList.remove("hidden");
+    $("#page-host")?.remove(); $("#table-body").closest(".table-wrap").classList.remove("hidden");
     $("#page-title").textContent = page;
     $("#navigation").querySelectorAll("button").forEach(button => button.classList.toggle("active", button.dataset.page === page));
     $("#dashboard").classList.toggle("hidden", page !== "Dashboard");
@@ -1137,7 +1186,7 @@
       && textMatches([entry.reference, entry.action, entry.actor_name, entry.reason, entry.previous_status, entry.new_status], search));
     const filtered = Boolean(search || client || project || from || to);
     $("#approval-count").textContent = `${shown.length} awaiting`;
-    $("#approval-body").innerHTML = shown.map(record => `<tr><td><strong>${escapeHtml(record.client_name)}</strong></td><td><strong>${escapeHtml(record.name)}</strong></td><td>${escapeHtml(record.completion_engineer_name || record.engineer_name)}</td><td>${escapeHtml(record.completion_date || "—")}</td><td>${escapeHtml(record.completion_status)}</td><td>${escapeHtml(record.invoice_number || "—")}</td><td><button data-project-images="${escapeHtml(record.id)}">View Completion</button>${decisionButtons(record, false)}</td></tr>`).join("") || `<tr><td colspan="7">${filtered ? "No completions awaiting approval match these filters." : "No completions are awaiting approval."}</td></tr>`;
+    $("#approval-body").innerHTML = shown.map(record => `<tr><td><strong>${escapeHtml(record.client_name)}</strong></td><td><strong>${escapeHtml(record.name)}</strong></td><td>${escapeHtml(record.completion_engineer_name || record.engineer_name)}</td><td>${escapeHtml(record.showDate(record.completion_date) || "—")}</td><td>${escapeHtml(record.completion_status)}</td><td>${escapeHtml(record.invoice_number || "—")}</td><td><button data-project-images="${escapeHtml(record.id)}">View Completion</button>${decisionButtons(record, false)}</td></tr>`).join("") || `<tr><td colspan="7">${filtered ? "No completions awaiting approval match these filters." : "No completions are awaiting approval."}</td></tr>`;
     $("#history-body").innerHTML = history.map(entry => `<tr><td>${escapeHtml(formatDateTime(entry.created_at))}</td><td>${escapeHtml(entry.reference)}</td><td>${escapeHtml(entry.previous_status)} → ${escapeHtml(entry.new_status)}</td><td>${escapeHtml(entry.action)}</td><td>${escapeHtml(entry.actor_name)}</td><td>${escapeHtml(entry.reason || "")}</td></tr>`).join("") || `<tr><td colspan="6">${filtered ? "No approval activity matches these filters." : "No approval activity yet."}</td></tr>`;
   }
   // "Work assigned to you": the signed-in engineer's own jobs, with a button that goes to the job's place on the map.
@@ -1149,7 +1198,7 @@
     $("#assigned-count").textContent = `${open.length} open job${open.length === 1 ? "" : "s"}`;
     $("#assigned-list").innerHTML = open.map(project => {
       const located = project.latitude != null && project.longitude != null, key = statusKey(project);
-      const when = [projectDay(project), project.visit_time].filter(Boolean).join(" · ");
+      const when = [showDate(projectDay(project)), showTime(project.visit_time)].filter(Boolean).join(" · ");
       return `<div class="assigned-job" data-job="${escapeHtml(project.id)}"><div class="assigned-main"><strong>${escapeHtml(project.client_name || "Client not set")}</strong><strong>${escapeHtml(project.name)}</strong><span>${escapeHtml([when, project.service, project.location].filter(Boolean).join(" · "))}</span></div><span class="status-badge approval-${key}">${escapeHtml(STATUS_LABELS[key] || project.approval_status || "Pending")}</span><div class="assigned-actions">${located ? `<button class="outline" data-locate="${escapeHtml(project.id)}">Go to location</button>` : '<span class="no-location">No map location yet</span>'}${completionButton(project, true)}</div></div>`;
     }).join("") || '<p class="muted">No work is assigned to you right now.</p>';
   }
@@ -1186,7 +1235,7 @@
     const key = statusKey(item), id = escapeHtml(item.id);
     const rows = [
       ["Engineer", item.engineer_name || "Engineer not assigned"],
-      ["Task", [item.service, item.so_no != null ? `SO ${item.so_no}` : "", item.start_date ? `${item.start_date} to ${item.end_date || item.start_date}` : "", item.visit_time ? `visit ${item.visit_time}` : ""].filter(Boolean).join(" · ")],
+      ["Task", [item.service, item.so_no != null ? `SO ${item.so_no}` : "", item.start_date ? `${showDate(item.start_date)} to ${showDate(item.end_date || item.start_date)}` : "", item.visit_time ? `visit ${showTime(item.visit_time)}` : ""].filter(Boolean).join(" · ")],
       ["Engineer visit", scheduleText(item, FREQUENCY_GROUPS[0])],
       ["Details", item.system_details || item.description],
       ["Location", item.location || `${Number(item.latitude).toFixed(5)}, ${Number(item.longitude).toFixed(5)}`],
@@ -1239,33 +1288,75 @@
     const choices = [["Projects","projects"],["Clients","clients"]];
     $("#table-body").innerHTML = choices.map(([label, value]) => `<tr><td>${label}</td><td>CSV · Excel · PDF</td><td>${["csv","xlsx","pdf"].map(format => `<a href="${api}/reports/export?resource=${value}&format=${format}" data-report="${value}" data-format="${format}">${format.toUpperCase()}</a>`).join(" · ")}</td></tr>`).join("");
   }
-  async function renderSettings() {
+  // The Certificates and Settings pages show cards here instead of the records table.
+  function pageHost() {
+    const wrap = $("#table-body").closest(".table-wrap");
+    let host = $("#page-host");
+    if (!host) { host = document.createElement("div"); host.id = "page-host"; wrap.after(host); }
+    wrap.classList.add("hidden");
+    return host;
+  }
+  function choiceOptions(choices, chosen) {
+    return choices.map(([value, label]) => `<option value="${escapeHtml(value)}"${value === chosen ? " selected" : ""}>${escapeHtml(label)}</option>`).join("");
+  }
+  function timeZoneOptions(chosen) {
+    let zones;
+    try { zones = Intl.supportedValuesOf("timeZone"); } catch { zones = ["UTC"]; }
+    if (chosen && !zones.includes(chosen)) zones = [chosen, ...zones];
+    const device = Intl.DateTimeFormat().resolvedOptions().timeZone || "unknown";
+    return choiceOptions([["", `Automatic (this device: ${device})`], ...zones.map(zone => [zone, zone.replaceAll("_", " ")])], chosen);
+  }
+  function renderSettings() {
     $("#records-title").textContent = "Settings";
     $("#records-count").textContent = "";
-    $("#table-head").innerHTML = "<tr><th>Preference</th><th>Value</th></tr>";
-    try {
-      const settings = await request("/settings");
-      const org = settings.organization || {}, user = settings.user || {};
-      $("#table-body").innerHTML = `<tr><td colspan="2"><form id="settings-form">
-        <label>Organization name<input name="org_name" value="${escapeHtml(org.name || "")}" ${currentRole === "administrator" ? "" : "disabled"}></label>
-        <label>Support contact<input name="support_contact" value="${escapeHtml(org.support_contact || "")}" ${currentRole === "administrator" ? "" : "disabled"}></label>
-        <label>Time zone<input name="time_zone" value="${escapeHtml(user.time_zone || org.time_zone || "UTC")}"></label>
-        <label>Date format<input name="date_format" value="${escapeHtml(user.date_format || org.date_format || "YYYY-MM-DD")}"></label>
-        <label>Time format<select name="time_format"><option value="24h" ${user.time_format !== "12h" ? "selected" : ""}>24-hour</option><option value="12h" ${user.time_format === "12h" ? "selected" : ""}>12-hour</option></select></label>
-        <label>Appearance<select name="appearance"><option>system</option><option ${user.appearance === "light" ? "selected" : ""}>light</option><option ${user.appearance === "dark" ? "selected" : ""}>dark</option></select></label>
-        <button class="primary" type="submit">Save settings</button></form></td></tr>`;
-      $("#settings-form").onsubmit = async event => {
-        event.preventDefault();
-        const form = new FormData(event.currentTarget);
-        const values = Object.fromEntries(form.entries());
-        const payload = {
-          user: { time_zone: values.time_zone, date_format: values.date_format, time_format: values.time_format, appearance: values.appearance },
-        };
-        if (currentRole === "administrator") payload.organization = { name: values.org_name, support_contact: values.support_contact };
-        try { await request("/settings", { method: "PATCH", body: JSON.stringify(payload) }); showError("Settings saved."); $("#notice").classList.remove("error"); }
-        catch (error) { showError(error.message); }
-      };
-    } catch (error) { showError(error.message); }
+    $("#table-head").innerHTML = "";
+    const today = isoDate(new Date()), saved = message => { showError(message); $("#notice").classList.remove("error"); };
+    pageHost().innerHTML = `<div id="settings-page">
+      <section class="cert-section"><h3>My account</h3>
+        <form id="settings-name" class="cert-row"><label>Your name<input name="full_name" maxlength="255" required value="${escapeHtml(currentUser.full_name || "")}"></label>
+        <label>Email<input value="${escapeHtml(currentUser.email || "")}" disabled></label>
+        <button class="primary" type="submit">Save name</button></form></section>
+      ${currentRole === "administrator" ? `<section class="cert-section"><h3>Company</h3>
+        <p class="hint">The company name goes at the top of exported reports. The support phone and email appear for everyone under "Need help?" in the menu.</p>
+        <form id="settings-company" class="cert-row"><label>Company name<input name="name" maxlength="255" value="${escapeHtml(company.name || "")}"></label>
+        <label>Support phone<input name="support_phone" type="tel" maxlength="40" value="${escapeHtml(company.support_phone || "")}"></label>
+        <label>Support email<input name="support_email" type="email" maxlength="320" value="${escapeHtml(company.support_email || "")}"></label>
+        <button class="primary" type="submit">Save company details</button></form></section>` : ""}
+      <section class="cert-section"><h3>Display</h3>
+        <p class="hint">How dates and times appear for you on every page and in the reports you export.</p>
+        <form id="settings-display" class="cert-row">
+        <label>Date format<select name="date_format">${choiceOptions(DATE_FORMATS.map(format => [format, `${showDate(today, format)} (${format})`]), prefs.date_format)}</select></label>
+        <label>Time format<select name="time_format">${choiceOptions([["24h", "24-hour (14:30)"], ["12h", "12-hour (2:30 PM)"]], prefs.time_format)}</select></label>
+        <label>Time zone<select name="time_zone">${timeZoneOptions(prefs.time_zone)}</select></label>
+        <button class="primary" type="submit">Save display</button></form></section>
+      <section class="cert-section"><h3>About</h3>
+        <p>Wolgan · Website created by <b>Roshin VP</b></p>
+        <p>For any request or enquiries: <a class="contact-dev" href="${escapeHtml(DEV_CONTACT)}" target="_blank" rel="noopener">devroshinvp@gmail.com</a></p></section>
+    </div>`;
+    const values = form => Object.fromEntries(new FormData(form).entries());
+    $("#settings-name").onsubmit = async event => {
+      event.preventDefault();
+      try {
+        currentUser.full_name = (await request("/auth/profile", { method: "PATCH", body: JSON.stringify(values(event.currentTarget)) })).data.full_name;
+        showUserLabel(); saved("Name saved.");
+      } catch (error) { showError(error.message); }
+    };
+    if ($("#settings-company")) $("#settings-company").onsubmit = async event => {
+      event.preventDefault();
+      const details = values(event.currentTarget);
+      try {
+        await request("/settings", { method: "PATCH", body: JSON.stringify({ organization: details }) });
+        Object.assign(company, details); renderSupport(); saved("Company details saved.");
+      } catch (error) { showError(error.message); }
+    };
+    $("#settings-display").onsubmit = async event => {
+      event.preventDefault();
+      const display = values(event.currentTarget);
+      try {
+        await request("/settings", { method: "PATCH", body: JSON.stringify({ user: display }) });
+        prefs = { ...prefs, ...display }; saved("Display saved. Dates and times now follow it.");
+      } catch (error) { showError(error.message); }
+    };
   }
   async function downloadFile(response, fallbackName) {
     const blob = await response.blob(), link = document.createElement("a");
@@ -1278,7 +1369,7 @@
   function certificateRows(templates) {
     if (!templates) return '<tr><td colspan="5">Loading saved templates…</td></tr>';
     return templates.map(template => `<tr><td><strong>${escapeHtml(template.name)}</strong><br><small>${escapeHtml(template.original_filename)}</small></td>
-      <td>${escapeHtml(template.service)}</td><td>${escapeHtml(template.file_type.toUpperCase())}</td><td>${escapeHtml((template.created_at || "").slice(0, 10))}</td>
+      <td>${escapeHtml(template.service)}</td><td>${escapeHtml(template.file_type.toUpperCase())}</td><td>${escapeHtml(showDate((template.created_at || "").slice(0, 10)))}</td>
       <td><button data-cert-view="${escapeHtml(template.id)}">View</button><button data-cert-delete="${escapeHtml(template.id)}">Delete</button></td></tr>`).join("")
       || '<tr><td colspan="5">No templates yet. Upload one above to get started.</td></tr>';
   }
@@ -1304,11 +1395,7 @@
       <label>Certificate type<select name="service" required>${certificateServiceOptions()}</select></label>
       <div class="file-field"><label class="primary file-pick"><input name="file" type="file" accept=".pptx,.docx" required><span>Select the editable file</span></label><small class="file-name">No file selected</small></div>
       <button class="primary" type="submit">Upload template</button></form></section>`;
-    const wrap = $("#table-body").closest(".table-wrap");
-    let host = $("#cert-host");
-    if (!host) { host = document.createElement("div"); host.id = "cert-host"; wrap.after(host); }
-    wrap.classList.add("hidden");
-    host.innerHTML = `<div id="cert-page">${upload}
+    pageHost().innerHTML = `<div id="cert-page">${upload}
       <section class="cert-section"><h3>Saved templates</h3>
       <div class="table-scroll"><table class="cert-table"><thead><tr><th>Template</th><th>Certificate type</th><th>Type</th><th>Uploaded</th><th>Action</th></tr></thead>
       <tbody id="cert-saved">${certificateRows(null)}</tbody></table></div></section></div>`;
@@ -1399,7 +1486,7 @@
   }
   document.querySelectorAll(".login-tabs button").forEach(tab => { tab.onclick = () => chooseLoginType(tab.dataset.loginType); });
   $("#forgot").onclick = () => {
-    $("#login-message").textContent = "Contact your WaterCare administrator to reset your password.";
+    $("#login-message").textContent = "Contact your Wolgan administrator to reset your password.";
   };
   $("#logout").onclick = async () => {
     try { await request("/auth/logout", { method: "POST" }); }
@@ -1544,7 +1631,7 @@
         const response = await fetch(`${report.href}${params.toString() ? `&${params}` : ""}`, { credentials: "same-origin" });
         if (!response.ok) throw new Error("Report export failed.");
         const blob = await response.blob(), link = document.createElement("a");
-        link.href = URL.createObjectURL(blob); link.download = `watercare-${report.dataset.report}-report.${report.dataset.format}`; link.click(); URL.revokeObjectURL(link.href);
+        link.href = URL.createObjectURL(blob); link.download = `wolgan-${report.dataset.report}-report.${report.dataset.format}`; link.click(); URL.revokeObjectURL(link.href);
       } catch (error) { showError(error.message); }
     }
   };

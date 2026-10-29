@@ -19,7 +19,7 @@ import sys
 from pathlib import Path
 
 ROOT = Path(__file__).resolve().parent.parent
-SCHEMA = ROOT / "d1-migrations" / "0001_initial_schema.sql"
+MIGRATIONS = ROOT / "d1-migrations"
 sys.path.insert(0, str(ROOT))
 
 from backend.security.passwords import worker_can_check  # noqa: E402
@@ -38,9 +38,10 @@ def literal(value):
 
 
 def d1_tables():
-    """Tables and columns of the D1 schema, in the order they are created (parents before children)."""
+    """Tables and columns of the D1 schema after every migration, in the order they are created (parents before children)."""
     schema = sqlite3.connect(":memory:")
-    schema.executescript(SCHEMA.read_text(encoding="utf-8"))
+    for migration in sorted(MIGRATIONS.glob("*.sql")):
+        schema.executescript(migration.read_text(encoding="utf-8"))
     names = [row[0] for row in schema.execute("SELECT name FROM sqlite_master WHERE type = 'table' ORDER BY rowid")]
     return {name: [row[1] for row in schema.execute(f"PRAGMA table_info({name})")] for name in names}
 

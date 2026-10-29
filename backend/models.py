@@ -50,7 +50,9 @@ organization_settings = Table(
     "organization_settings", db.metadata,
     Column("organization_id", String(36), ForeignKey("organizations.id"), primary_key=True),
     Column("name", String(255)),
-    Column("support_contact", String(255)),
+    Column("support_contact", String(255)),  # before support_phone / support_email; copied into support_phone
+    Column("support_phone", String(40)),
+    Column("support_email", String(320)),
     Column("time_zone", String(100), nullable=False, default="UTC"),
     Column("date_format", String(40), nullable=False, default="YYYY-MM-DD"),
     Column("time_format", String(10), nullable=False, default="24h"),

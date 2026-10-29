@@ -19,7 +19,9 @@ from backend.models import (
 )
 from backend.utils import certificates as certs, storage
 from backend.utils.pdf_convert import PdfUnavailable, convert_to_pdf
-from backend.utils.schedule_export import HEADERS as SCHEDULE_HEADERS, month_year, schedule_rows, schedule_workbook
+from backend.utils.schedule_export import (
+    HEADERS as SCHEDULE_HEADERS, label_with_company, month_year, schedule_rows, schedule_workbook,
+)
 from backend.security.passwords import hash_password, verify_password
 from backend.security.authentication import ADMIN_LOGIN_ROLES, LoginRefused, login, require_user
 from backend.utils.validators import (
@@ -220,7 +222,7 @@ def me():
     if not session.get("csrf_token"):
         session["csrf_token"] = secrets.token_urlsafe(32)
     return jsonify({
-        "user": {"id": g.user.id, "email": getattr(g.user, "email", None)},
+        "user": {"id": g.user.id, "email": getattr(g.user, "email", None), "full_name": getattr(g.user, "full_name", None)},
         "organization_id": g.organization_id,
         "role": g.role,
         "csrf_token": session["csrf_token"],
@@ -347,6 +349,23 @@ def change_password():
     sqlalchemy_db.session.commit()
     session.clear()
     return jsonify({"message": "Password changed. Sign in again."})
+
+
+@api.patch("/auth/profile")
+@require_user()
+def update_profile():
+    payload = request.get_json(silent=True)
+    name = payload.get("full_name") if isinstance(payload, dict) else None
+    if not isinstance(name, str) or not 1 <= len(name.strip()) <= 255:
+        return failure("invalid_request", "Enter your name (up to 255 characters).", 400)
+    now = datetime.now(timezone.utc).isoformat()
+    sqlalchemy_db.session.execute(users.update().where(users.c.id == g.user.id).values(full_name=name.strip(), updated_at=now))
+    # An employee's engineer profile carries the same name on the Engineers page and on certificates.
+    sqlalchemy_db.session.execute(engineers.update().where(
+        engineers.c.organization_id == g.organization_id, engineers.c.user_id == g.user.id,
+    ).values(full_name=name.strip(), updated_at=now))
+    sqlalchemy_db.session.commit()
+    return jsonify({"data": {"full_name": name.strip()}})
 
 
 @api.get("/dashboard/summary")
@@ -1437,6 +1456,17 @@ def delete_upload(file_id):
         return failure("storage_error", "The document could not be deleted.", 503)
 
 
+def _report_preferences():
+    """The company name for report headings and the reader's date format (their own, else the company's)."""
+    company = db().table("organization_settings").select("name,date_format").eq(
+        "organization_id", g.organization_id
+    ).limit(1).execute().data or [{}]
+    mine = db().table("user_settings").select("date_format").eq(
+        "organization_id", g.organization_id
+    ).eq("user_id", g.user.id).limit(1).execute().data or [{}]
+    return company[0].get("name") or "", mine[0].get("date_format") or company[0].get("date_format") or "YYYY-MM-DD"
+
+
 @api.get("/reports/export")
 @require_user()
 def export_report():
@@ -1482,13 +1512,14 @@ def export_report():
                 query = query.eq("engineer_id", request.args["engineer_id"])
         query = in_project_order(query) if table == "projects" else query.order("created_at", desc=True)
         rows = query.limit(5000).execute().data or []
+        company, date_format = _report_preferences()
         schedule = None
         if resource == "projects":
             missing = list({row["client_id"] for row in rows if not row.get("client_name") and row.get("client_id")})
             found = db().table("clients").select("id,name").eq("organization_id", g.organization_id).in_("id", missing).execute().data if missing else []
-            schedule = schedule_rows(rows, {client["id"]: client["name"] for client in found or []})
+            schedule = schedule_rows(rows, {client["id"]: client["name"] for client in found or []}, date_format)
         fields = [field for field in rows[0] if field not in {"organization_id", "deleted_at"}] if rows else []
-        basename = f"watercare-{resource}-report"
+        basename = f"wolgan-{resource}-report"
         if output_format == "csv":
             output = io.StringIO()
             if schedule is not None:
@@ -1507,11 +1538,12 @@ def export_report():
         elif output_format == "xlsx":
             from openpyxl import Workbook
             if schedule is not None:
-                workbook = schedule_workbook(schedule, safe_spreadsheet_value)
+                workbook = schedule_workbook(schedule, safe_spreadsheet_value, company)
             else:
                 workbook = Workbook()
                 sheet = workbook.active
                 sheet.title = resource[:31]
+                label_with_company(workbook, sheet, company, f"{resource.title()} report")
                 if fields:
                     sheet.append(fields)
                     for row in rows:
@@ -1527,13 +1559,16 @@ def export_report():
         else:
             from reportlab.lib import colors
             from reportlab.lib.pagesizes import landscape, letter
-            from reportlab.platypus import SimpleDocTemplate, Table, TableStyle
+            from reportlab.lib.styles import getSampleStyleSheet
+            from reportlab.platypus import Paragraph, SimpleDocTemplate, Spacer, Table, TableStyle
+            from xml.sax.saxutils import escape
             raw = io.BytesIO()
             if schedule is not None:
                 data = [SCHEDULE_HEADERS] + [[str(value)[:200] for value in line] for line in schedule]
             else:
                 data = [fields or ["No records found"]] + [[str(row.get(field, ""))[:200] for field in fields] for row in rows]
-            pdf = SimpleDocTemplate(raw, pagesize=landscape(letter))
+            pdf = SimpleDocTemplate(raw, pagesize=landscape(letter), title=f"{company} - {resource.title()} report" if company else "")
+            heading = [Paragraph(escape(company), getSampleStyleSheet()["Heading2"]), Spacer(1, 6)] if company else []
             table = Table(data, repeatRows=1)
             table.setStyle(TableStyle([
                 ("BACKGROUND", (0, 0), (-1, 0), colors.HexColor("#142B35")),
@@ -1541,7 +1576,7 @@ def export_report():
                 ("GRID", (0, 0), (-1, -1), 0.25, colors.lightgrey),
                 ("FONTSIZE", (0, 0), (-1, -1), 7),
             ]))
-            pdf.build([table])
+            pdf.build([*heading, table])
             mime, extension = "application/pdf", "pdf"
         raw.seek(0)
         return send_file(raw, mimetype=mime, as_attachment=True, download_name=f"{basename}.{extension}")

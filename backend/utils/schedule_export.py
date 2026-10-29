@@ -16,19 +16,31 @@ def month_year(value):
         return ""
 
 
-def frequency_text(frequency, custom_date):
+DATE_PATTERNS = {"DD/MM/YYYY": "%d/%m/%Y", "MM/DD/YYYY": "%m/%d/%Y"}
+
+
+def show_date(value, date_format="YYYY-MM-DD"):
+    """A stored YYYY-MM-DD date in the reader's chosen format; anything else is returned unchanged."""
+    try:
+        parsed = date.fromisoformat(str(value)[:10])
+    except ValueError:
+        return value
+    return parsed.strftime(DATE_PATTERNS[date_format]) if date_format in DATE_PATTERNS else parsed.isoformat()
+
+
+def frequency_text(frequency, custom_date, date_format="YYYY-MM-DD"):
     if not frequency:
         return ""
-    return f"{frequency} ({custom_date})" if frequency == "Custom" and custom_date else frequency
+    return f"{frequency} ({show_date(custom_date, date_format)})" if frequency == "Custom" and custom_date else frequency
 
 
-def service_text(row, toggle, frequency, custom_date):
+def service_text(row, toggle, frequency, custom_date, date_format="YYYY-MM-DD"):
     if row.get(toggle) != "Yes":
         return "NO"
-    return f"Yes {frequency_text(row.get(frequency), row.get(custom_date)).lower()}".strip()
+    return f"Yes {frequency_text(row.get(frequency), row.get(custom_date), date_format).lower()}".strip()
 
 
-def schedule_rows(rows, client_names):
+def schedule_rows(rows, client_names, date_format="YYYY-MM-DD"):
     """One list per project. SL NO and the client name appear on the first row of each client only."""
     groups = {}
     for row in rows:
@@ -42,18 +54,20 @@ def schedule_rows(rows, client_names):
             table.append([
                 serial if number == 1 else "", name if number == 1 else "", number, row.get("name") or "",
                 row["so_no"] if row.get("so_no") is not None else "", period, row.get("system_details") or "",
-                frequency_text(row.get("engineer_visit"), row.get("engineer_visit_custom_date")),
-                service_text(row, "microbiology", "microbiology_frequency", "microbiology_custom_date"),
-                service_text(row, "legionella", "legionella_frequency", "legionella_custom_date"),
+                frequency_text(row.get("engineer_visit"), row.get("engineer_visit_custom_date"), date_format),
+                service_text(row, "microbiology", "microbiology_frequency", "microbiology_custom_date", date_format),
+                service_text(row, "legionella", "legionella_frequency", "legionella_custom_date", date_format),
             ])
     return table
 
 
-def schedule_workbook(table, clean):
-    """Build the sheet; `clean` neutralises spreadsheet formulas in user text."""
+def schedule_workbook(table, clean, company=""):
+    """Build the sheet; `clean` neutralises spreadsheet formulas in user text. The company name goes in the printed
+    page header and the file's properties, so the grid keeps the client's layout."""
     workbook = Workbook()
     sheet = workbook.active
     sheet.title = "Client schedule"
+    label_with_company(workbook, sheet, company, "Client schedule")
     thin = Side(style="thin", color="000000")
     border = Border(left=thin, right=thin, top=thin, bottom=thin)
     green, yellow = PatternFill("solid", fgColor="92D86B"), PatternFill("solid", fgColor="FFFF00")
@@ -84,6 +98,14 @@ def schedule_workbook(table, clean):
         sheet.column_dimensions[letter].width = width
     sheet.freeze_panes = "A2"
     return workbook
+
+
+def label_with_company(workbook, sheet, company, title):
+    if company:
+        workbook.properties.creator = company
+        workbook.properties.title = f"{company} - {title}"
+        sheet.oddHeader.center.text = company.replace("&", "&&")  # "&" starts a header code in Excel
+        sheet.oddHeader.center.size = 12
 
 
 def _merge_client(sheet, first, last):

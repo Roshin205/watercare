@@ -60,8 +60,8 @@ def ask(label):
 def main():
     parser = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     parser.add_argument("--email", required=True)
-    parser.add_argument("--name", default="Administrator")
-    parser.add_argument("--organization", default="WaterCare", help="used only when D1 has no company yet")
+    parser.add_argument("--name", default="", help="blank: the menu shows the email until they add a name in Settings")
+    parser.add_argument("--organization", default="Wolgan", help="used only when D1 has no company yet")
     parser.add_argument("--database", default="watercare")
     where = parser.add_mutually_exclusive_group(required=True)
     where.add_argument("--remote", action="store_true", help="the deployed D1 database")

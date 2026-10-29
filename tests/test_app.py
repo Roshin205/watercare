@@ -418,39 +418,49 @@ def test_rejected_project_does_not_create_its_client(app, client):
 
 def test_settings_are_validated_and_record_each_update(client):
     for invalid in (
-        {"user": {"appearance": "x" * 500}},
+        {"user": {"appearance": "dark"}},  # removed: there is no dark theme
+        {"user": {"date_format": "x" * 500}},
+        {"user": {"date_format": "DD.MM.YY"}},
         {"user": {"time_format": "25h"}},
         {"user": {"time_zone": {"zone": "UTC"}}},
         {"user": {"notification_preferences": "email"}},
         {"organization": {"name": 7}},
+        {"organization": {"time_zone": ""}},
+        {"organization": {"support_email": "not-an-email"}},
+        {"organization": {"support_phone": "call the office"}},
     ):
         response = client.patch("/api/settings", headers=csrf(client), json=invalid)
         assert response.status_code == 400, invalid
 
-    assert client.patch("/api/settings", headers=csrf(client), json={"user": {"appearance": "dark"}}).status_code == 200
+    assert client.patch("/api/settings", headers=csrf(client), json={"user": {"date_format": "DD/MM/YYYY"}}).status_code == 200
     first = client.get("/api/settings").json["user"]["updated_at"]
     time.sleep(0.01)
-    assert client.patch("/api/settings", headers=csrf(client), json={"user": {"appearance": "light"}}).status_code == 200
+    assert client.patch("/api/settings", headers=csrf(client), json={"user": {"date_format": "MM/DD/YYYY"}}).status_code == 200
     second = client.get("/api/settings").json["user"]
-    assert second["appearance"] == "light"
+    assert second["date_format"] == "MM/DD/YYYY"
     assert second["updated_at"] > first
 
 
 def test_settings_are_saved_with_organization_and_user_scope(client):
     response = client.patch("/api/settings", headers=csrf(client), json={
-        "organization": {"name": "Updated organization"},
-        "user": {"appearance": "dark", "time_zone": "UTC"},
+        "organization": {"name": "Updated organization", "support_phone": "+971 4 555 0100", "support_email": "help@example.test"},
+        "user": {"date_format": "DD/MM/YYYY", "time_format": "12h", "time_zone": ""},
     })
     assert response.status_code == 200
     saved = client.get("/api/settings").json
     assert saved["organization"]["name"] == "Updated organization"
-    assert saved["user"]["appearance"] == "dark"
+    assert saved["organization"]["support_phone"] == "+971 4 555 0100"
+    assert saved["organization"]["support_email"] == "help@example.test"
+    assert saved["user"]["date_format"] == "DD/MM/YYYY"
+    assert saved["user"]["time_zone"] == ""  # blank: follow the device's time zone
 
 
-def test_login_shell_preserves_watercare_brand_and_has_no_provider_globals(app):
+def test_login_shell_shows_the_wolgan_brand_and_developer_credit_and_has_no_provider_globals(app):
     response = app.test_client().get("/")
     assert response.status_code == 200
-    assert b"WaterCare" in response.data
+    assert b"<title>Wolgan |" in response.data and b"Welcome to Wolgan" in response.data
+    assert b"Website created by <b>Roshin VP</b>" in response.data
+    assert b"to=devroshinvp@gmail.com" in response.data
     assert b"window.WATERCARE_" not in response.data
 
 
@@ -859,6 +869,7 @@ def test_migration_adds_new_fields_and_keeps_existing_records(tmp_path):
                     "now": now,
                 })
             connection.execute(text("INSERT INTO engineers (id, organization_id, full_name, is_active, created_at, updated_at) VALUES ('e', 'o', 'Existing Engineer', 1, :now, :now)"), {"now": now})
+            connection.execute(text("INSERT INTO organization_settings (organization_id, support_contact, time_zone, date_format, time_format, updated_at) VALUES ('o', '+971 4 555 0100', 'UTC', 'YYYY-MM-DD', '24h', :now)"), {"now": now})
         upgrade()
         inspector = inspect(db.engine)
         assert {
@@ -868,7 +879,8 @@ def test_migration_adds_new_fields_and_keeps_existing_records(tmp_path):
         assert "engineer_code" in {column["name"] for column in inspector.get_columns("engineers")}
         assert "approval_history" in inspector.get_table_names()
         with db.engine.connect() as connection:
-            assert connection.execute(text("SELECT version_num FROM alembic_version")).scalar() == "202610300010"
+            assert connection.execute(text("SELECT version_num FROM alembic_version")).scalar() == "202610310011"
+            assert connection.execute(text("SELECT support_phone FROM organization_settings")).scalar() == "+971 4 555 0100"
             assert connection.execute(text("SELECT role FROM organization_memberships WHERE id = 'mm'")).scalar() == "service_coordinator"
             assert {"completion_date", "completion_engineer_name"} <= {column["name"] for column in inspector.get_columns("projects")}
             rows = dict(connection.execute(text("SELECT id, approval_status FROM projects")).all())
@@ -1161,6 +1173,33 @@ def test_projects_export_uses_the_client_schedule_layout(client):
         assert client.get(f"/api/reports/export?resource=projects&format={fmt}").status_code == 200
 
 
+def test_report_exports_carry_the_company_name_and_the_readers_date_format(client):
+    from io import BytesIO
+    from openpyxl import load_workbook
+    assert client.patch("/api/settings", headers=csrf(client), json={
+        "organization": {"name": "Gulf & Co"}, "user": {"date_format": "DD/MM/YYYY"},
+    }).status_code == 200
+    new_project(client, client_name="Acme", name="Solo", so_no=7, start_date="2026-05-01", end_date="2026-05-20",
+                engineer_visit="Custom", engineer_visit_custom_date="2026-05-04")
+    workbook = load_workbook(BytesIO(client.get("/api/reports/export?resource=projects&format=xlsx").data))
+    sheet = workbook.active
+    assert [cell.value for cell in sheet[1]][:2] == ["SL NO", "Client"]  # the grid keeps the client's layout
+    assert sheet.oddHeader.center.text == "Gulf && Co"  # "&&" prints as "&"
+    assert workbook.properties.creator == "Gulf & Co"
+    assert sheet["H2"].value == "Custom (04/05/2026)"
+    assert b"Gulf" in client.get("/api/reports/export?resource=projects&format=pdf").data
+
+
+def test_account_name_can_be_changed_and_follows_the_engineer_profile(app, client):
+    assert client.patch("/api/auth/profile", headers=csrf(client), json={"full_name": "  "}).status_code == 400
+    assert client.patch("/api/auth/profile", headers=csrf(client), json={"full_name": "Owner Name"}).status_code == 200
+    assert client.get("/api/auth/me").json["user"]["full_name"] == "Owner Name"
+    employee = add_account(app, client, "employee", "Field Engineer")
+    assert employee.patch("/api/auth/profile", headers=csrf(employee), json={"full_name": "Field Engineer Two"}).status_code == 200
+    names = [row["full_name"] for row in client.get("/api/engineers?limit=200").json["data"]]
+    assert "Field Engineer Two" in names and "Field Engineer" not in names
+
+
 def _certificate_file(text_runs):
     """A one-slide deck whose text is split across several runs, the way PowerPoint often stores it."""
     from io import BytesIO
@@ -1434,9 +1473,9 @@ def test_empty_database_reports_not_set_up_instead_of_a_server_error():
 
 def test_d1_migration_creates_every_table_and_column_the_app_uses():
     import sqlite3
-    sql = (Path(__file__).parent.parent / "d1-migrations" / "0001_initial_schema.sql").read_text(encoding="utf-8")
     connection = sqlite3.connect(":memory:")
-    connection.executescript(sql)
+    for migration in sorted((Path(__file__).parent.parent / "d1-migrations").glob("*.sql")):
+        connection.executescript(migration.read_text(encoding="utf-8"))
     for table in db.metadata.sorted_tables:
         columns = {row[1] for row in connection.execute(f"PRAGMA table_info({table.name})")}
         # Old columns kept by earlier migrations (projects.start_time, end_time) may remain; every current one must exist.

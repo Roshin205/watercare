@@ -43,9 +43,10 @@ RESOURCE_FIELDS = {
     },
 }
 SETTINGS_FIELDS = {
-    "organization": {"name": 255, "support_contact": 255, "time_zone": 100, "date_format": 40, "time_format": 10},
-    "user": {"appearance": 20, "notification_preferences": None, "date_format": 40, "time_format": 10, "time_zone": 100},
+    "organization": {"name": 255, "support_phone": 40, "support_email": 320, "time_zone": 100, "date_format": 40, "time_format": 10},
+    "user": {"notification_preferences": None, "date_format": 40, "time_format": 10, "time_zone": 100},
 }
+DATE_FORMATS = {"YYYY-MM-DD", "DD/MM/YYYY", "MM/DD/YYYY"}
 PROJECT_STATUSES = {"Planned", "Scheduled", "In Progress", "Completed", "On Hold", "Cancelled"}
 CLEANING_STATUSES = {"Scheduled", "In Progress", "Completed", "Overdue", "Cancelled"}
 TASK_STATUSES = {"Planned", "Scheduled", "In Progress", "Completed", "On Hold", "Cancelled"}
@@ -214,12 +215,15 @@ def validate_settings(scope, values):
                 return "notification_preferences must be a JSON object."
         elif not isinstance(value, str) or len(value) > limits[key]:
             return f"{key} must be text of at most {limits[key]} characters."
-    if "appearance" in values and values["appearance"] not in {"system", "light", "dark"}:
-        return "appearance must be system, light, or dark."
     if "time_format" in values and values["time_format"] not in {"12h", "24h"}:
         return "time_format must be 12h or 24h."
-    if "time_zone" in values and not re.fullmatch(r"[A-Za-z0-9_+\-/]+", values["time_zone"]):
+    # A blank personal time zone means "use this device's time zone".
+    if "time_zone" in values and not (scope == "user" and values["time_zone"] == "") and not re.fullmatch(r"[A-Za-z0-9_+\-/]+", values["time_zone"]):
         return "time_zone must be a time zone name such as UTC or Asia/Riyadh."
-    if "date_format" in values and not values["date_format"].strip():
-        return "date_format cannot be empty."
+    if "date_format" in values and values["date_format"] not in DATE_FORMATS:
+        return "date_format must be YYYY-MM-DD, DD/MM/YYYY or MM/DD/YYYY."
+    if values.get("support_email") and not re.fullmatch(r"[^@\s]+@[^@\s]+\.[^@\s]+", values["support_email"]):
+        return "Support email must be a valid email address."
+    if values.get("support_phone") and not re.fullmatch(r"[0-9+()\-. ]{3,40}", values["support_phone"]):
+        return "Support phone can use digits, spaces and + ( ) - only."
     return None
