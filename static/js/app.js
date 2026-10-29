@@ -401,8 +401,11 @@
   function navigate(nextPage) {
     if ((nextPage === "Approvals" || nextPage === "Certificates") && !canEdit()) return;
     if (nextPage === "Services" && currentRole !== "administrator") return;
-    if (nextPage !== page) resetFilters();
+    const changed = nextPage !== page;
+    if (changed) resetFilters();
     page = nextPage; hideError();
+    // Nothing from the previous page stays on screen while this page's data loads.
+    if (changed) { $("#table-head").innerHTML = ""; $("#table-body").innerHTML = ""; $("#records-count").textContent = ""; }
     $("#cert-host")?.remove(); $("#table-body").closest(".table-wrap").classList.remove("hidden");
     $("#page-title").textContent = page;
     $("#navigation").querySelectorAll("button").forEach(button => button.classList.toggle("active", button.dataset.page === page));
@@ -434,7 +437,7 @@
     $("#reset-order-dashboard").classList.toggle("hidden", !manualOrder);
   }
   async function loadRecords() {
-    const definition = resources[page], reorder = page === "Projects" && canEdit();
+    const shown = page, definition = resources[page], reorder = page === "Projects" && canEdit();
     const photoColumn = page === "Engineers", columnCount = definition.columns.length + 1 + (reorder ? 1 : 0) + (photoColumn ? 1 : 0);
     $("#records-title").textContent = page;
     $("#table-head").innerHTML = `<tr>${reorder ? '<th class="handle-col" aria-label="Work order"></th>' : ""}${photoColumn ? "<th>Photo</th>" : ""}${definition.columns.map(field => `<th>${escapeHtml(fieldLabels[field] || field.replaceAll("_", " "))}</th>`).join("")}<th>Actions</th></tr>`;
@@ -442,6 +445,7 @@
       const query = filterParams(PAGE_FILTERS[page]);
       query.set("limit", "200");
       const response = await request(`/${definition.path}?${query}`);
+      if (page !== shown) return;  // another page was opened while this one loaded
       records = response.data || [];
       $("#records-count").textContent = `${records.length}${records.length === 200 ? "+" : ""} record${records.length === 1 ? "" : "s"}`;
       let previousDay = null;
@@ -1268,24 +1272,38 @@
     const named = /filename="?([^";]+)"?/.exec(response.headers.get("content-disposition") || "");
     link.href = URL.createObjectURL(blob); link.download = named ? named[1] : fallbackName; link.click(); URL.revokeObjectURL(link.href);
   }
+  function certificateServiceOptions() {
+    return '<option value="">Choose a service</option>' + services.filter(service => service.is_active).map(service => `<option>${escapeHtml(service.name)}</option>`).join("");
+  }
+  function certificateRows(templates) {
+    if (!templates) return '<tr><td colspan="5">Loading saved templates…</td></tr>';
+    return templates.map(template => `<tr><td><strong>${escapeHtml(template.name)}</strong><br><small>${escapeHtml(template.original_filename)}</small></td>
+      <td>${escapeHtml(template.service)}</td><td>${escapeHtml(template.file_type.toUpperCase())}</td><td>${escapeHtml((template.created_at || "").slice(0, 10))}</td>
+      <td><button data-cert-view="${escapeHtml(template.id)}">View</button><button data-cert-delete="${escapeHtml(template.id)}">Delete</button></td></tr>`).join("")
+      || '<tr><td colspan="5">No templates yet. Upload one above to get started.</td></tr>';
+  }
   async function renderCertificates() {
     $("#records-title").textContent = "Certificates";
     $("#records-count").textContent = "";
     $("#table-head").innerHTML = "";
-    let templates = [];
+    if (!$("#cert-page")) drawCertificatePage();  // the page shows at once; the lists fill in when they arrive
+    let templates;
     try {
       await loadServices();
       templates = (await request("/certificate-templates")).data || [];
     } catch (error) { showError(error.message); return; }
-    const active = services.filter(service => service.is_active);
+    if (page !== "Certificates" || !$("#cert-page")) return;  // another page was opened meanwhile
+    const select = $("#cert-upload [name=service]"), chosen = select.value;
+    select.innerHTML = certificateServiceOptions();
+    select.value = chosen;
+    $("#cert-saved").innerHTML = certificateRows(templates);
+  }
+  function drawCertificatePage() {
     const upload = `<section class="cert-section"><h3>Upload new statement templates</h3>
       <form id="cert-upload" class="cert-row"><label>Template name<input name="name" maxlength="200" placeholder="e.g. Disinfection certificate"></label>
-      <label>Certificate type<select name="service" required><option value="">Choose a service</option>${active.map(service => `<option>${escapeHtml(service.name)}</option>`).join("")}</select></label>
+      <label>Certificate type<select name="service" required>${certificateServiceOptions()}</select></label>
       <div class="file-field"><label class="primary file-pick"><input name="file" type="file" accept=".pptx,.docx" required><span>Select the editable file</span></label><small class="file-name">No file selected</small></div>
       <button class="primary" type="submit">Upload template</button></form></section>`;
-    const saved = templates.map(template => `<tr><td><strong>${escapeHtml(template.name)}</strong><br><small>${escapeHtml(template.original_filename)}</small></td>
-      <td>${escapeHtml(template.service)}</td><td>${escapeHtml(template.file_type.toUpperCase())}</td><td>${escapeHtml((template.created_at || "").slice(0, 10))}</td>
-      <td><button data-cert-view="${escapeHtml(template.id)}">View</button><button data-cert-delete="${escapeHtml(template.id)}">Delete</button></td></tr>`).join("");
     const wrap = $("#table-body").closest(".table-wrap");
     let host = $("#cert-host");
     if (!host) { host = document.createElement("div"); host.id = "cert-host"; wrap.after(host); }
@@ -1293,15 +1311,16 @@
     host.innerHTML = `<div id="cert-page">${upload}
       <section class="cert-section"><h3>Saved templates</h3>
       <div class="table-scroll"><table class="cert-table"><thead><tr><th>Template</th><th>Certificate type</th><th>Type</th><th>Uploaded</th><th>Action</th></tr></thead>
-      <tbody>${saved || '<tr><td colspan="5">No templates yet. Upload one above to get started.</td></tr>'}</tbody></table></div></section></div>`;
+      <tbody id="cert-saved">${certificateRows(null)}</tbody></table></div></section></div>`;
     const picker = $("#cert-upload [name=file]");
     picker.onchange = () => { $("#cert-upload .file-name").textContent = picker.files[0]?.name || "No file selected"; };
     $("#cert-upload").onsubmit = async event => {
       event.preventDefault();
-      const form = new FormData(event.currentTarget);
+      const formElement = event.currentTarget, form = new FormData(formElement);
       if (!form.get("name")) form.delete("name");
       try {
         await request("/certificate-templates", { method: "POST", body: form });
+        formElement.reset(); $("#cert-upload .file-name").textContent = "No file selected";
         await renderCertificates();
         showError("Template saved."); $("#notice").classList.remove("error");
       } catch (error) { showError(error.message); }
