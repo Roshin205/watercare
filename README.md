@@ -20,7 +20,9 @@ How the Flask app fits Workers: Flask runs through Cloudflare's WSGI adapter. SQ
 before and `backend/d1.py` sends it to D1 through the binding (parameterised `?` placeholders, never string-joined
 values). D1 has no multi-statement transactions, so each statement is saved on its own. Python's `hashlib` has no
 PBKDF2 or scrypt inside Workers, so `backend/security/passwords.py` uses the runtime's Web Crypto API and writes the same
-`pbkdf2:sha256:600000$salt$hash` format a normal Python server reads.
+`pbkdf2:sha256:100000$salt$hash` format a normal Python server reads. Cloudflare's Web Crypto refuses PBKDF2 above
+100,000 iterations (the local `pywrangler dev` runtime does not enforce this), so hashes made with more cannot be
+checked in the Worker and those accounts need a new password.
 
 ## Local setup
 
@@ -85,8 +87,8 @@ Nothing is deleted from the old database or the old upload folder; the steps onl
 
 1. Apply the D1 schema first: `npx wrangler d1 migrations apply watercare --remote`.
 2. Export the rows: `python scripts/export_to_d1.py --source instance/watercare.db --out d1-import.sql`. The script
-   prints each table's row count and lists accounts whose passwords are stored as `scrypt` (those cannot be checked in
-   the Worker and need a new password: `scripts/d1_admin.py` for administrators, the Engineers page for employees).
+   prints each table's row count and lists accounts whose passwords are stored as `scrypt` or with more than 100,000
+   PBKDF2 iterations (those cannot be checked in the Worker and need a new password: `scripts/d1_admin.py` for administrators, the Engineers page for employees).
 3. Load them: `npx wrangler d1 execute watercare --remote --file d1-import.sql`, then delete `d1-import.sql`.
 4. Copy the files under the same keys: `python scripts/export_to_d1.py --source instance/watercare.db --upload-files --remote`.
 5. Compare counts before switching users over, for example

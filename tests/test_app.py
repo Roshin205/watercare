@@ -1371,15 +1371,25 @@ def test_worker_passwords_use_web_crypto_pbkdf2_in_werkzeug_format(monkeypatch):
     from werkzeug.security import check_password_hash, generate_password_hash
     from backend.security import passwords
     monkeypatch.setattr(passwords, "in_workers", lambda: True)
-    monkeypatch.setattr(passwords, "_webcrypto_pbkdf2", lambda password, salt, iterations, hash_name="SHA-256", length=32: hashlib.pbkdf2_hmac(
-        hash_name.replace("-", "").lower(), password.encode(), salt.encode(), iterations, length).hex())
+
+    def web_crypto(password, salt, iterations, hash_name="SHA-256", length=32):
+        if iterations > 100_000:  # what Cloudflare's Web Crypto answers
+            raise RuntimeError(f"NotSupportedError: Pbkdf2 failed: iteration counts above 100000 are not supported (requested {iterations}).")
+        return hashlib.pbkdf2_hmac(hash_name.replace("-", "").lower(), password.encode(), salt.encode(), iterations, length).hex()
+
+    monkeypatch.setattr(passwords, "_webcrypto_pbkdf2", web_crypto)
     stored = passwords.hash_password("worker-password-1")
-    assert stored.startswith("pbkdf2:sha256:600000$")
+    assert stored.startswith("pbkdf2:sha256:100000$")
     assert passwords.verify_password(stored, "worker-password-1")
     assert not passwords.verify_password(stored, "wrong-password-1")
     assert check_password_hash(stored, "worker-password-1")  # the same hash still works on a normal server
     assert passwords.verify_password(generate_password_hash("local-made", method="pbkdf2:sha256:1000"), "local-made")
     assert not passwords.verify_password(generate_password_hash("old-scrypt", method="scrypt"), "old-scrypt")
+    too_many = generate_password_hash("old-pbkdf2", method="pbkdf2:sha256:600000")
+    assert not passwords.verify_password(too_many, "old-pbkdf2")  # refused as a wrong login, not a server error
+    assert not passwords.worker_can_check(too_many)
+    assert passwords.worker_can_check(stored)
+    assert not passwords.worker_can_check(generate_password_hash("old-scrypt", method="scrypt"))
 
 
 def test_worker_config_uses_the_d1_driver():

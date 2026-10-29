@@ -7,8 +7,9 @@
 3. Upload the saved files under their same keys:
        python scripts/export_to_d1.py --source instance/watercare.db --upload-files --remote
 
-Accounts whose password is stored as "scrypt" cannot be checked inside the Worker; the script lists them so their
-passwords can be set again (scripts/d1_admin.py for the administrator, the Engineers page for employees).
+Accounts whose password or private key is stored as "scrypt", or as PBKDF2 with more than 100,000 iterations, cannot
+be checked inside the Worker; the script lists them so they can be set again (scripts/d1_admin.py for the
+administrator, the Engineers page for employees).
 """
 import argparse
 import shutil
@@ -19,6 +20,9 @@ from pathlib import Path
 
 ROOT = Path(__file__).resolve().parent.parent
 SCHEMA = ROOT / "d1-migrations" / "0001_initial_schema.sql"
+sys.path.insert(0, str(ROOT))
+
+from backend.security.passwords import worker_can_check  # noqa: E402
 
 
 def literal(value):
@@ -92,9 +96,12 @@ def main():
         print(f"Wrote {sum(counts.values())} rows to {args.out}:")
         for table, count in counts.items():
             print(f"  {table}: {count}")
-        old = [row[0] for row in source.execute("SELECT email FROM users WHERE password_hash LIKE 'scrypt:%'")]
+        old = [email for email, password_hash, access_key_hash
+               in source.execute("SELECT email, password_hash, access_key_hash FROM users")
+               if not worker_can_check(password_hash) or (access_key_hash and not worker_can_check(access_key_hash))]
         if old:
-            print("These accounts need a new password after the move (scrypt hashes cannot be checked in the Worker):")
+            print("These accounts need a new password (and private key) after the move; the Worker cannot check how"
+                  " they are stored now:")
             for email in old:
                 print(f"  {email}")
 
