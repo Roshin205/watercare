@@ -52,7 +52,7 @@ class LoginRefused(Exception):
     """The email and password were right, but the account must use the other login."""
 
 
-def login(email, password, login_type="client", access_key=""):
+def login(email, password, login_type="staff", access_key=""):
     if len(password) > 512 or len(access_key) > 512:
         return None
     row = db.session.execute(select(users).where(users.c.email == email.lower())).mappings().first()
@@ -68,7 +68,7 @@ def login(email, password, login_type="client", access_key=""):
     role = organization_rows[0].role
     if login_type == "admin":
         if role not in ADMIN_LOGIN_ROLES:
-            raise LoginRefused("This account uses the Client login.")
+            raise LoginRefused("This account uses the Staff login.")
         # The key must exist and match; accounts without a key cannot use the admin login at all.
         if not row["access_key_hash"] or not access_key or not verify_password(row["access_key_hash"], access_key):
             return None

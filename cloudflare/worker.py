@@ -1,6 +1,6 @@
 """Cloudflare Worker entry point: the WaterCare Flask app on Python Workers.
 
-Bindings (wrangler.jsonc): DB = D1 database, FILES = private R2 bucket, PDF = LibreOffice converter service.
+Bindings (wrangler.jsonc): DB = D1 database, FILES = private R2 bucket.
 Secret: SECRET_KEY (signs the session cookie). Static files under /static are served by Workers Static Assets.
 """
 from workers import wsgi

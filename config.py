@@ -9,7 +9,7 @@ class Config:
     # Re-read page templates on every request outside production, so an edited page never lags behind its scripts.
     TEMPLATES_AUTO_RELOAD = os.environ.get("FLASK_ENV") != "production"
     SQLALCHEMY_ENGINE_OPTIONS = {"pool_pre_ping": True, "pool_recycle": 300}
-    MAX_CONTENT_LENGTH = 15 * 1024 * 1024
+    MAX_CONTENT_LENGTH = 21 * 1024 * 1024
     STORAGE_PATH = os.environ.get("STORAGE_PATH", os.path.join("instance", "uploads"))
     SESSION_COOKIE_HTTPONLY = True
     SESSION_COOKIE_SAMESITE = "Lax"

@@ -1,4 +1,4 @@
-from sqlalchemy import Boolean, Column, Float, ForeignKey, Index, Integer, JSON, String, Table, Text, UniqueConstraint
+from sqlalchemy import Boolean, Column, ForeignKey, Index, Integer, JSON, String, Table, Text, UniqueConstraint
 
 from backend.database import db
 
@@ -83,175 +83,16 @@ clients = business_table(
     Column("notes", Text),
     Column("is_active", Boolean, nullable=False, default=True),
 )
-engineers = business_table(
-    "engineers",
-    Column("user_id", String(36), ForeignKey("users.id"), nullable=True, index=True),
-    Column("engineer_code", String(50)),
-    Column("full_name", String(255), nullable=False),
-    Column("email", String(320)),
-    Column("phone", String(60)),
-    Column("specialization", String(255)),
-    Column("availability", String(255)),
-    Column("is_active", Boolean, nullable=False, default=True),
-    Index("uq_engineers_organization_code", "organization_id", "engineer_code", unique=True),
-)
-projects = business_table(
-    "projects",
-    Column("client_id", String(36), ForeignKey("clients.id"), nullable=False, index=True),
-    Column("name", String(255), nullable=False),
-    Column("service", String(40)),
-    Column("client_name", String(255)),
-    Column("so_no", Integer),
-    Column("contract_period", String(10)),
-    Column("system_details", Text),
-    Column("engineer_name", String(255)),
-    Column("engineer_visit", String(20)),
-    Column("engineer_visit_custom_date", String(10)),
-    Column("microbiology", String(3)),
-    Column("microbiology_frequency", String(20)),
-    Column("microbiology_custom_date", String(10)),
-    Column("legionella", String(3)),
-    Column("legionella_frequency", String(20)),
-    Column("legionella_custom_date", String(10)),
-    Column("category", String(100)),
-    Column("location", Text),
-    Column("latitude", Float),
-    Column("longitude", Float),
-    Column("description", Text),
-    Column("start_date", String(10)),
-    Column("scheduled_date", String(10), index=True),
-    Column("scheduled_time", String(16)),
-    Column("end_date", String(10)),
-    Column("visit_time", String(16)),
-    Column("status", String(40), nullable=False, default="Planned", index=True),
-    Column("notes", Text),
-    Column("completion_status", String(40)),
-    Column("completion_date", String(10)),
-    Column("completion_engineer_name", String(320)),
-    Column("expected_duration", Integer),
-    Column("completed_duration", Integer),
-    Column("additional_duration", Integer),
-    Column("invoice_number", String(100)),
-    Column("approval_status", String(40), default="Pending", index=True),
-    Column("rejection_reason", Text),
-    # Manual "do this first" order: the date slot a project is sorted under, and its position within that slot.
-    Column("priority_date", String(10)),
-    Column("priority_rank", Float),
-)
-project_engineers = Table(
-    "project_engineers", db.metadata,
-    Column("organization_id", String(36), ForeignKey("organizations.id"), nullable=False, index=True),
-    Column("project_id", String(36), ForeignKey("projects.id"), primary_key=True),
-    Column("engineer_id", String(36), ForeignKey("engineers.id"), primary_key=True),
-    Column("created_by", String(36)),
-    Column("updated_by", String(36)),
-    Column("created_at", String(40), nullable=False),
-)
-project_tasks = business_table(
-    "project_tasks",
-    Column("project_id", String(36), ForeignKey("projects.id"), nullable=False, index=True),
-    Column("engineer_id", String(36), ForeignKey("engineers.id"), index=True),
-    Column("title", String(255), nullable=False),
-    Column("description", Text),
-    Column("scheduled_date", String(10), nullable=False, index=True),
-    Column("scheduled_time", String(16)),
-    Column("location", Text),
-    Column("status", String(40), nullable=False, default="Scheduled", index=True),
-    Column("notes", Text),
-)
-cleaning_records = business_table(
-    "cleaning_records",
-    Column("client_id", String(36), ForeignKey("clients.id"), nullable=False, index=True),
-    Column("engineer_id", String(36), ForeignKey("engineers.id"), index=True),
-    Column("site_name", String(255)),
-    Column("tank_identification", String(255)),
-    Column("tank_type", String(100)),
-    Column("capacity", Float),
-    Column("location", Text),
-    Column("cleaning_date", String(10), nullable=False, index=True),
-    Column("cleaning_time", String(16)),
-    Column("procedure", Text),
-    Column("materials_used", Text),
-    Column("observations", Text),
-    Column("status", String(40), nullable=False, default="Scheduled", index=True),
-    Column("next_recommended_date", String(10)),
-    Column("notes", Text),
-)
-water_testing_records = business_table(
-    "water_testing_records",
-    Column("client_id", String(36), ForeignKey("clients.id"), nullable=False, index=True),
-    Column("project_id", String(36), ForeignKey("projects.id"), index=True),
-    Column("engineer_id", String(36), ForeignKey("engineers.id"), index=True),
-    Column("sampling_location", Text),
-    Column("collection_date", String(10), nullable=False, index=True),
-    Column("collection_time", String(16)),
-    Column("water_source", String(255)),
-    Column("testing_category", String(100)),
-    Column("sample_identification", String(255)),
-    Column("test_parameters", JSON, nullable=False, default=list),
-    Column("test_results", JSON, nullable=False, default=dict),
-    Column("reference_limits", JSON, nullable=False, default=dict),
-    Column("interpretation", Text),
-    Column("laboratory_details", Text),
-    Column("status", String(40), nullable=False, default="Collected", index=True),
-    Column("notes", Text),
-)
 uploaded_documents = business_table(
     "uploaded_documents",
     Column("related_type", String(40), nullable=False),
     Column("related_id", String(36), nullable=False, index=True),
     Column("original_filename", String(255), nullable=False),
-    Column("image_type", String(10)),
+    Column("image_type", String(40)),
     Column("storage_path", Text, nullable=False, unique=True),
     Column("mime_type", String(150), nullable=False),
     Column("file_size", Integer, nullable=False),
     Column("uploaded_by", String(36), ForeignKey("users.id")),
-)
-approval_history = Table(
-    "approval_history", db.metadata,
-    Column("id", String(36), primary_key=True),
-    Column("organization_id", String(36), ForeignKey("organizations.id"), nullable=False, index=True),
-    Column("project_id", String(36), ForeignKey("projects.id"), index=True),
-    Column("task_id", String(36), ForeignKey("project_tasks.id")),
-    Column("reference", String(600), nullable=False),
-    Column("previous_status", String(40), nullable=False),
-    Column("new_status", String(40), nullable=False),
-    Column("action", String(40), nullable=False),
-    Column("reason", Text),
-    Column("actor_id", String(36), ForeignKey("users.id")),
-    Column("actor_name", String(320), nullable=False),
-    Column("created_at", String(40), nullable=False, index=True),
-)
-notifications = business_table(
-    "notifications",
-    Column("user_id", String(36), ForeignKey("users.id"), index=True),
-    Column("title", String(255), nullable=False),
-    Column("message", Text, nullable=False),
-    Column("read_at", String(40)),
-)
-audit_logs = Table(
-    "audit_logs", db.metadata,
-    Column("id", Integer, primary_key=True, autoincrement=True),
-    Column("organization_id", String(36), index=True),
-    Column("actor_id", String(36), ForeignKey("users.id")),
-    Column("table_name", String(100), nullable=False),
-    Column("record_id", String(100)),
-    Column("action", String(40), nullable=False),
-    Column("old_data", JSON),
-    Column("new_data", JSON),
-    Column("created_at", String(40), nullable=False),
-)
-
-
-certificate_templates = business_table(
-    "certificate_templates",
-    Column("name", String(200), nullable=False),
-    Column("service", String(120), nullable=False, index=True),
-    Column("original_filename", String(255), nullable=False),
-    Column("file_type", String(8), nullable=False),
-    Column("storage_path", String(500), nullable=False),
-    Column("file_size", Integer, nullable=False),
-    Column("tags", JSON),
 )
 
 
@@ -263,3 +104,18 @@ services = business_table(
     Column("validity_months", Integer),
     Column("is_active", Boolean, nullable=False, default=True),
 )
+
+
+# Everything on the Operations pages (contracts, samples, delivery notes, staff, custom sections...): one row per
+# record. `collection` says which kind (backend/utils/hub_schema.py lists them), `parent_id` and `period` are the two
+# things rows are looked up by, and `data` holds the fields, so a new custom section never needs a new table.
+hub_records = business_table(
+    "hub_records",
+    Column("collection", String(40), nullable=False),
+    Column("parent_id", String(36)),
+    Column("period", String(10)),
+    Column("data", JSON, nullable=False, default=dict),
+)
+Index("ix_hub_records_collection", hub_records.c.organization_id, hub_records.c.collection, hub_records.c.deleted_at)
+Index("ix_hub_records_parent", hub_records.c.organization_id, hub_records.c.collection, hub_records.c.parent_id)
+Index("ix_hub_records_period", hub_records.c.organization_id, hub_records.c.collection, hub_records.c.period)

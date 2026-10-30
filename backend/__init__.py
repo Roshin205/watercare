@@ -15,6 +15,7 @@ from backend import d1  # noqa: F401 - registers the "sqlite+d1://" database URL
 from backend.database import Database, db
 from backend.runtime import in_workers
 from backend.routes.api import api
+from backend.routes.hub import hub
 from backend.security.passwords import hash_password
 from backend import models
 
@@ -44,6 +45,7 @@ def create_app(config_object=Config):
     if not in_workers():  # In the Worker, files live in R2 (backend/utils/storage.py).
         os.makedirs(app.config["STORAGE_PATH"], exist_ok=True)
     app.register_blueprint(api, url_prefix="/api")
+    app.register_blueprint(hub, url_prefix="/api/hub")
 
     @app.before_request
     def validate_csrf():
@@ -164,7 +166,7 @@ def create_app(config_object=Config):
 
     @app.errorhandler(413)
     def too_large(_error):
-        return jsonify({"error": {"code": "file_too_large", "message": "Upload exceeds 15 MB."}}), 413
+        return jsonify({"error": {"code": "file_too_large", "message": "Upload is too large."}}), 413
 
     @app.errorhandler(HTTPException)
     def http_error(error):

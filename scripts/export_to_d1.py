@@ -9,7 +9,7 @@
 
 Accounts whose password or private key is stored as "scrypt", or as PBKDF2 with more than 100,000 iterations, cannot
 be checked inside the Worker; the script lists them so they can be set again (scripts/d1_admin.py for the
-administrator, the Engineers page for employees).
+administrator, Reset Login on Staff Profiles for staff).
 """
 import argparse
 import shutil

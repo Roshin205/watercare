@@ -1,4 +1,4 @@
-// WaterCare on Cloudflare: Python Worker (Flask) + D1 + R2 + the PDF converter container (pdf-converter/).
+// Wolgan on Cloudflare: Python Worker (Flask) + D1 + R2.
 // Deploy: uv run pywrangler deploy   ·   Local: uv run pywrangler dev
 {
   "$schema": "node_modules/wrangler/config-schema.json",
@@ -24,20 +24,13 @@
       "migrations_dir": "d1-migrations"
     }
   ],
-  // Off until R2 is switched on for the account and pdf-converter/ is deployed. Until then uploads and certificate
-  // downloads answer with an error; everything kept in D1 works. To turn them on, uncomment both blocks and redeploy.
+  // Off until R2 is switched on for the account. Until then uploads answer with an error; everything kept in D1 works.
+  // To turn it on, uncomment this block and redeploy.
   // "r2_buckets": [
   //   {
   //     // Private bucket: files are only served through the app's signed-in routes.
   //     "binding": "FILES",
   //     "bucket_name": "watercare-files"
-  //   }
-  // ],
-  // "services": [
-  //   {
-  //     // Certificate PDFs: the LibreOffice container Worker in pdf-converter/ (deploy it first).
-  //     "binding": "PDF",
-  //     "service": "watercare-pdf"
   //   }
   // ],
   "observability": {

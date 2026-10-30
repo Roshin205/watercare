@@ -1,4 +1,4 @@
-"""Client schedule layout for the Projects report: one block per client, projects listed beneath it."""
+"""Client schedule layout for the AMC contracts export: one block per client, its sites listed beneath it."""
 from datetime import date
 
 from openpyxl import Workbook
@@ -16,47 +16,20 @@ def month_year(value):
         return ""
 
 
-DATE_PATTERNS = {"DD/MM/YYYY": "%d/%m/%Y", "MM/DD/YYYY": "%m/%d/%Y"}
-
-
-def show_date(value, date_format="YYYY-MM-DD"):
-    """A stored YYYY-MM-DD date in the reader's chosen format; anything else is returned unchanged."""
-    try:
-        parsed = date.fromisoformat(str(value)[:10])
-    except ValueError:
-        return value
-    return parsed.strftime(DATE_PATTERNS[date_format]) if date_format in DATE_PATTERNS else parsed.isoformat()
-
-
-def frequency_text(frequency, custom_date, date_format="YYYY-MM-DD"):
-    if not frequency:
-        return ""
-    return f"{frequency} ({show_date(custom_date, date_format)})" if frequency == "Custom" and custom_date else frequency
-
-
-def service_text(row, toggle, frequency, custom_date, date_format="YYYY-MM-DD"):
-    if row.get(toggle) != "Yes":
-        return "NO"
-    return f"Yes {frequency_text(row.get(frequency), row.get(custom_date), date_format).lower()}".strip()
-
-
-def schedule_rows(rows, client_names, date_format="YYYY-MM-DD"):
-    """One list per project. SL NO and the client name appear on the first row of each client only."""
+def schedule_rows(contracts):
+    """One list per contract. SL NO and the client name appear on the first row of each client only."""
     groups = {}
-    for row in rows:
-        name = row.get("client_name") or client_names.get(row.get("client_id")) or "No client"
-        groups.setdefault(name, []).append(row)
+    for row in contracts:
+        groups.setdefault(row.get("client") or "No client", []).append(row)
     table = []
     for serial, name in enumerate(sorted(groups, key=str.lower), start=1):
         for number, row in enumerate(groups[name], start=1):
-            start, end = month_year(row.get("start_date")), month_year(row.get("end_date"))
-            period = f"{start} to {end}" if start and end and end != start else start or end
+            start, end = month_year(row.get("start")), month_year(row.get("expiry"))
+            period = row.get("period_text") or (f"{start} to {end}" if start and end and end != start else start or end)
             table.append([
-                serial if number == 1 else "", name if number == 1 else "", number, row.get("name") or "",
-                row["so_no"] if row.get("so_no") is not None else "", period, row.get("system_details") or "",
-                frequency_text(row.get("engineer_visit"), row.get("engineer_visit_custom_date"), date_format),
-                service_text(row, "microbiology", "microbiology_frequency", "microbiology_custom_date", date_format),
-                service_text(row, "legionella", "legionella_frequency", "legionella_custom_date", date_format),
+                serial if number == 1 else "", name if number == 1 else "", number, row.get("site") or "", row.get("so") or "",
+                period, row.get("system_details") or "", row.get("frequency") or "",
+                "Yes" if row.get("microbiology") == "Yes" else "NO", "Yes" if row.get("legionella") == "Yes" else "NO",
             ])
     return table
 
